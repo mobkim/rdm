@@ -872,6 +872,9 @@ app.post('/api/files/transfer', (req, res) => {
         if (!fs.existsSync(src)) return res.status(404).json({ error: 'Source file not found' });
         fs.mkdirSync(toDir, { recursive: true });
         fs.copyFileSync(src, dest);
+        // Delete the source only after the copy succeeds, so a failed copy
+        // never silently destroys the original.
+        fs.unlinkSync(src);
         res.json({ success: true });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
@@ -893,6 +896,35 @@ app.delete('/api/files/:instanceId/:filename', (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
+// Fallback cleanup: delete any staged files older than 24 hours. Runs every
+// hour so files dropped into RDM Transfer but never transferred don't
+// accumulate on disk indefinitely.
+const STAGING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const STAGING_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+const cleanStagingDirs = () => {
+    if (!fs.existsSync(DRIVES_DIR)) return;
+    const now = Date.now();
+    try {
+        for (const instanceDir of fs.readdirSync(DRIVES_DIR, { withFileTypes: true })) {
+            if (!instanceDir.isDirectory()) continue;
+            const dirPath = path.join(DRIVES_DIR, instanceDir.name);
+            for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+                if (!entry.isFile()) continue;
+                const filePath = path.join(dirPath, entry.name);
+                try {
+                    const { mtimeMs } = fs.statSync(filePath);
+                    if (now - mtimeMs > STAGING_MAX_AGE_MS) fs.unlinkSync(filePath);
+                } catch {
+                    // File may have been deleted between readdir and stat — ignore.
+                }
+            }
+        }
+    } catch (err) {
+        console.error('Staging cleanup error:', err);
+    }
+};
+setInterval(cleanStagingDirs, STAGING_CLEANUP_INTERVAL_MS);
 
 // Serve the built frontend. Must come after the /api/* routes above so those
 // still take priority; the catch-all below is last so client-side routing
