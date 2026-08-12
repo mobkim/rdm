@@ -2302,7 +2302,12 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
             {/* File transfer panel */}
             {fileTransferPanel && (
                 <FileTransferPanel
-                    sessions={orderedSessions.map(s => ({ instanceId: s.instanceId, name: s.name }))}
+                    sessions={orderedSessions.map(s => {
+                    const custom = customInstances.find(c => c.id === s.instanceId);
+                    const ec2 = instances.find(i => i.id === s.instanceId);
+                    const name = custom?.name || ec2?.label || ec2?.name || s.name;
+                    return { instanceId: s.instanceId, name };
+                })}
                     fromInstanceId={fileTransferPanel.fromInstanceId}
                     apiBase={API_BASE}
                     onClose={() => setFileTransferPanel(null)}
