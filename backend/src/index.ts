@@ -503,6 +503,14 @@ app.post('/api/connect', async (req, res) => {
             }
         };
 
+        // Pre-create the host-side staging directory so guacd finds it ready.
+        // Docker's create-drive-path only creates paths inside the container;
+        // the host-side parent must exist before the mount is useful.
+        if (protocol === 'rdp') {
+            const driveDir = path.join(DRIVES_DIR, instanceId || customId || 'unknown');
+            fs.mkdirSync(driveDir, { recursive: true });
+        }
+
         // Encrypt the connection settings into a token
         const tokenCrypt = new Crypt(GUAC_CRYPT_CYPHER, GUAC_CRYPT_KEY);
         const token = tokenCrypt.encrypt(connectionSettings);
