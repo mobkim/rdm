@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Maximize, Minimize, RefreshCw, X, GripVertical } from 'lucide-react';
+import { Maximize, Minimize, RefreshCw, X, GripVertical, FolderOpen } from 'lucide-react';
 import Guacamole from 'guacamole-common-js';
 import { writeDeviceClipboard } from './deviceClipboard';
 import { OS_ICONS } from './OsIcons';
@@ -34,9 +34,11 @@ interface Props {
     // to every other open session.
     clipboard: string;
     onClipboard: (text: string) => void;
+    // Opens the app-level file transfer panel pre-selected to this session.
+    onFileTransfer?: () => void;
 }
 
-export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, protocol, os, swapCtrlCmd, onDisconnect, onRefresh, onError, clipboard, onClipboard, onReorderDragStart, onReorderDragEnd }) => {
+export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, protocol, os, swapCtrlCmd, onDisconnect, onRefresh, onError, clipboard, onClipboard, onReorderDragStart, onReorderDragEnd, onFileTransfer }) => {
     const rootRef = useRef<HTMLDivElement>(null);
     const headerRef = useRef<HTMLDivElement>(null);
     const displayRef = useRef<HTMLDivElement>(null);
@@ -409,6 +411,11 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, protocol, os
                     {onRefresh && (
                         <button onClick={(e) => { e.stopPropagation(); onRefresh(); }} className="text-slate-300 hover:text-white transition-colors" title="Refresh session">
                             <RefreshCw size={16} />
+                        </button>
+                    )}
+                    {onFileTransfer && protocol !== 'vnc' && (
+                        <button onClick={(e) => { e.stopPropagation(); onFileTransfer(); }} className="text-slate-300 hover:text-white transition-colors" title="File Transfer">
+                            <FolderOpen size={16} />
                         </button>
                     )}
                     <button onClick={(e) => { e.stopPropagation(); toggleFullscreen(); }} className="text-slate-300 hover:text-white transition-colors" title="Fullscreen">

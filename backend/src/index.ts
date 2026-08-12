@@ -84,6 +84,10 @@ const GUAC_CRYPT_KEY = process.env.GUAC_CRYPT_KEY || 'MySuperSecretKeyForGuacamo
 const GUAC_CRYPT_CYPHER = 'AES-256-CBC';
 const USE_SSM_TUNNEL = process.env.USE_SSM_TUNNEL === 'true';
 
+// Root directory for Guacamole virtual drive staging areas. One sub-directory
+// per instance ID; guacd maps each into Windows as the "RDM Transfer" drive.
+const DRIVES_DIR = process.env.DRIVES_DIR || path.join(__dirname, '..', '..', 'rdm-drives');
+
 
 app.get('/api/instances', async (req, res) => {
     try {
@@ -483,7 +487,14 @@ app.post('/api/connect', async (req, res) => {
                     'enable-font-smoothing': settings.fontSmoothing !== false ? 'true' : 'false',
                     'enable-theming': 'true',
                     'enable-desktop-composition': 'true',
-                    'enable-wallpaper': 'true'
+                    'enable-wallpaper': 'true',
+                    // Virtual drive: Windows sees this as a mapped "RDM Transfer"
+                    // drive in Explorer. Files dropped there land in DRIVES_DIR
+                    // and can be copied to any other connected server's staging dir.
+                    'enable-drive': 'true',
+                    'drive-name': 'RDM Transfer',
+                    'drive-path': path.join(DRIVES_DIR, instanceId || customId || 'unknown'),
+                    'create-drive-path': 'true'
                 }
             }
         };
@@ -794,6 +805,66 @@ app.post('/api/instances/:id/type', async (req, res) => {
         res.json({ success: true, instanceType });
     } catch (err: any) {
         console.error('Error changing instance type:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// File transfer — list, copy, and delete files in each instance's virtual
+// drive staging directory. The RDP connection above mounts DRIVES_DIR/<id>
+// as the "RDM Transfer" drive inside Windows, so anything the user drags
+// there from Explorer appears here immediately.
+// ---------------------------------------------------------------------------
+
+app.get('/api/files/:instanceId', (req, res) => {
+    const dir = path.join(DRIVES_DIR, req.params.instanceId);
+    try {
+        if (!fs.existsSync(dir)) return res.json([]);
+        const entries = fs.readdirSync(dir, { withFileTypes: true })
+            .filter(e => e.isFile())
+            .map(e => {
+                const stat = fs.statSync(path.join(dir, e.name));
+                return { name: e.name, size: stat.size, modified: stat.mtime.toISOString() };
+            });
+        res.json(entries);
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/files/transfer', (req, res) => {
+    const { fromInstanceId, toInstanceId, filename } = req.body;
+    if (!fromInstanceId || !toInstanceId || !filename) {
+        return res.status(400).json({ error: 'fromInstanceId, toInstanceId, and filename are required' });
+    }
+    // Guard against path traversal.
+    const safeName = path.basename(filename as string);
+    if (!safeName || safeName !== filename) {
+        return res.status(400).json({ error: 'Invalid filename' });
+    }
+    const src = path.join(DRIVES_DIR, fromInstanceId, safeName);
+    const destDir = path.join(DRIVES_DIR, toInstanceId);
+    const dest = path.join(destDir, safeName);
+    try {
+        if (!fs.existsSync(src)) return res.status(404).json({ error: 'Source file not found' });
+        fs.mkdirSync(destDir, { recursive: true });
+        fs.copyFileSync(src, dest);
+        res.json({ success: true });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/files/:instanceId/:filename', (req, res) => {
+    const safeName = path.basename(req.params.filename);
+    if (!safeName || safeName !== req.params.filename) {
+        return res.status(400).json({ error: 'Invalid filename' });
+    }
+    const filePath = path.join(DRIVES_DIR, req.params.instanceId, safeName);
+    try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        res.json({ success: true });
+    } catch (err: any) {
         res.status(500).json({ error: err.message });
     }
 });

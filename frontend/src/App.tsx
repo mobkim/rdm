@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useLayoutEffect } from 'react';
 import { Grid, LayoutGrid, Maximize, Square, PlayCircle, StopCircle, RefreshCw, PanelLeftClose, PanelLeftOpen, Plus, X, ChevronUp, ChevronDown, Settings, GalleryHorizontalEnd, Loader2, DollarSign, AlertTriangle, ArrowUpDown, GripVertical, Check, Cpu, LogOut, ShieldCheck, ShieldOff } from 'lucide-react';
 import { GuacamoleClient } from './GuacamoleClient';
+import { FileTransferPanel } from './FileTransferPanel';
 import { useDeviceClipboard } from './deviceClipboard';
 import { OS_ICONS } from './OsIcons';
 import type { AuthStatus } from './Auth';
@@ -375,6 +376,10 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
     // this text into its remote desktop, and reports back anything copied inside
     // it (see GuacamoleClient), so a copy anywhere is pastable everywhere.
     const [sharedClipboard, setSharedClipboard] = useState('');
+
+    // File transfer panel — null when closed, otherwise holds the instance ID
+    // of the session whose header button was clicked (pre-selected as source).
+    const [fileTransferPanel, setFileTransferPanel] = useState<{ fromInstanceId: string } | null>(null);
 
     // Per-instance loading states
     const [connecting, setConnecting] = useState<Record<string, boolean>>({});
@@ -1557,6 +1562,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                         onError={(message) => reportSessionError(session.instanceId, message)}
                                         onReorderDragStart={(e) => { setBlankDragImage(e); setDragId(session.instanceId); }}
                                         onReorderDragEnd={() => { setDragId(null); setDragOverId(null); }}
+                                        onFileTransfer={() => setFileTransferPanel({ fromInstanceId: session.instanceId })}
                                     />
                                 </div>
                                 );
@@ -2291,6 +2297,16 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                         )}
                     </div>
                 </div>
+            )}
+
+            {/* File transfer panel */}
+            {fileTransferPanel && (
+                <FileTransferPanel
+                    sessions={orderedSessions.map(s => ({ instanceId: s.instanceId, name: s.name }))}
+                    fromInstanceId={fileTransferPanel.fromInstanceId}
+                    apiBase={API_BASE}
+                    onClose={() => setFileTransferPanel(null)}
+                />
             )}
 
             {/* Toast notifications */}
