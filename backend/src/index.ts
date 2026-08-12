@@ -828,9 +828,14 @@ app.post('/api/instances/:id/type', async (req, res) => {
 // there from Explorer appears here immediately.
 // ---------------------------------------------------------------------------
 
-// Resolves an instance ID to its staging directory and verifies the result
-// stays inside DRIVES_DIR, preventing path traversal via crafted IDs.
+// Maximum file size allowed through the transfer API (500 MB).
+const MAX_FILE_BYTES = 500 * 1024 * 1024;
+
+// Resolves an instance ID to its staging directory and verifies:
+//  1. The ID contains only safe characters (alphanumeric, hyphens, underscores).
+//  2. The resolved path stays inside DRIVES_DIR (path traversal guard).
 const resolveInstanceDir = (instanceId: string): string | null => {
+    if (!/^[\w-]+$/.test(instanceId)) return null;
     const root = path.resolve(DRIVES_DIR);
     const dir = path.resolve(DRIVES_DIR, instanceId);
     return dir.startsWith(root + path.sep) ? dir : null;
@@ -870,6 +875,10 @@ app.post('/api/files/transfer', (req, res) => {
     const dest = path.join(toDir, safeName);
     try {
         if (!fs.existsSync(src)) return res.status(404).json({ error: 'Source file not found' });
+        const { size } = fs.statSync(src);
+        if (size > MAX_FILE_BYTES) {
+            return res.status(413).json({ error: `File exceeds the ${MAX_FILE_BYTES / (1024 * 1024)} MB transfer limit` });
+        }
         fs.mkdirSync(toDir, { recursive: true });
         fs.copyFileSync(src, dest);
         // Delete the source only after the copy succeeds, so a failed copy
