@@ -828,8 +828,17 @@ app.post('/api/instances/:id/type', async (req, res) => {
 // there from Explorer appears here immediately.
 // ---------------------------------------------------------------------------
 
+// Resolves an instance ID to its staging directory and verifies the result
+// stays inside DRIVES_DIR, preventing path traversal via crafted IDs.
+const resolveInstanceDir = (instanceId: string): string | null => {
+    const root = path.resolve(DRIVES_DIR);
+    const dir = path.resolve(DRIVES_DIR, instanceId);
+    return dir.startsWith(root + path.sep) ? dir : null;
+};
+
 app.get('/api/files/:instanceId', (req, res) => {
-    const dir = path.join(DRIVES_DIR, req.params.instanceId);
+    const dir = resolveInstanceDir(req.params.instanceId);
+    if (!dir) return res.status(400).json({ error: 'Invalid instance ID' });
     try {
         if (!fs.existsSync(dir)) return res.json([]);
         const entries = fs.readdirSync(dir, { withFileTypes: true })
@@ -849,17 +858,19 @@ app.post('/api/files/transfer', (req, res) => {
     if (!fromInstanceId || !toInstanceId || !filename) {
         return res.status(400).json({ error: 'fromInstanceId, toInstanceId, and filename are required' });
     }
-    // Guard against path traversal.
+    const fromDir = resolveInstanceDir(fromInstanceId);
+    const toDir = resolveInstanceDir(toInstanceId);
+    if (!fromDir || !toDir) return res.status(400).json({ error: 'Invalid instance ID' });
+    // Guard against path traversal in filename.
     const safeName = path.basename(filename as string);
     if (!safeName || safeName !== filename) {
         return res.status(400).json({ error: 'Invalid filename' });
     }
-    const src = path.join(DRIVES_DIR, fromInstanceId, safeName);
-    const destDir = path.join(DRIVES_DIR, toInstanceId);
-    const dest = path.join(destDir, safeName);
+    const src = path.join(fromDir, safeName);
+    const dest = path.join(toDir, safeName);
     try {
         if (!fs.existsSync(src)) return res.status(404).json({ error: 'Source file not found' });
-        fs.mkdirSync(destDir, { recursive: true });
+        fs.mkdirSync(toDir, { recursive: true });
         fs.copyFileSync(src, dest);
         res.json({ success: true });
     } catch (err: any) {
@@ -868,11 +879,13 @@ app.post('/api/files/transfer', (req, res) => {
 });
 
 app.delete('/api/files/:instanceId/:filename', (req, res) => {
+    const dir = resolveInstanceDir(req.params.instanceId);
+    if (!dir) return res.status(400).json({ error: 'Invalid instance ID' });
     const safeName = path.basename(req.params.filename);
     if (!safeName || safeName !== req.params.filename) {
         return res.status(400).json({ error: 'Invalid filename' });
     }
-    const filePath = path.join(DRIVES_DIR, req.params.instanceId, safeName);
+    const filePath = path.join(dir, safeName);
     try {
         if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
         res.json({ success: true });
