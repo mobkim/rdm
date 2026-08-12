@@ -86,7 +86,11 @@ const USE_SSM_TUNNEL = process.env.USE_SSM_TUNNEL === 'true';
 
 // Root directory for Guacamole virtual drive staging areas. One sub-directory
 // per instance ID; guacd maps each into Windows as the "RDM Transfer" drive.
+// DRIVES_DIR is the host path used by the file API (list/copy/delete).
+// GUAC_DRIVES_DIR is the path guacd sees — set this to the container-side
+// mount point when guacd runs in Docker (e.g. /rdm-drives).
 const DRIVES_DIR = process.env.DRIVES_DIR || path.join(__dirname, '..', '..', 'rdm-drives');
+const GUAC_DRIVES_DIR = process.env.GUAC_DRIVES_DIR || DRIVES_DIR;
 
 
 app.get('/api/instances', async (req, res) => {
@@ -493,7 +497,7 @@ app.post('/api/connect', async (req, res) => {
                     // and can be copied to any other connected server's staging dir.
                     'enable-drive': 'true',
                     'drive-name': 'RDM Transfer',
-                    'drive-path': path.join(DRIVES_DIR, instanceId || customId || 'unknown'),
+                    'drive-path': path.join(GUAC_DRIVES_DIR, instanceId || customId || 'unknown'),
                     'create-drive-path': 'true'
                 }
             }
