@@ -84,6 +84,14 @@ const GUAC_CRYPT_KEY = process.env.GUAC_CRYPT_KEY || 'MySuperSecretKeyForGuacamo
 const GUAC_CRYPT_CYPHER = 'AES-256-CBC';
 const USE_SSM_TUNNEL = process.env.USE_SSM_TUNNEL === 'true';
 
+// Root directory for Guacamole virtual drive staging areas. One sub-directory
+// per instance ID; guacd maps each into Windows as the "RDM Transfer" drive.
+// DRIVES_DIR is the host path used by the file API (list/copy/delete).
+// GUAC_DRIVES_DIR is the path guacd sees — set this to the container-side
+// mount point when guacd runs in Docker (e.g. /rdm-drives).
+const DRIVES_DIR = process.env.DRIVES_DIR || path.join(__dirname, '..', '..', 'rdm-drives');
+const GUAC_DRIVES_DIR = process.env.GUAC_DRIVES_DIR || DRIVES_DIR;
+
 
 app.get('/api/instances', async (req, res) => {
     try {
@@ -483,10 +491,25 @@ app.post('/api/connect', async (req, res) => {
                     'enable-font-smoothing': settings.fontSmoothing !== false ? 'true' : 'false',
                     'enable-theming': 'true',
                     'enable-desktop-composition': 'true',
-                    'enable-wallpaper': 'true'
+                    'enable-wallpaper': 'true',
+                    // Virtual drive: Windows sees this as a mapped "RDM Transfer"
+                    // drive in Explorer. Files dropped there land in DRIVES_DIR
+                    // and can be copied to any other connected server's staging dir.
+                    'enable-drive': 'true',
+                    'drive-name': 'RDM Transfer',
+                    'drive-path': path.join(GUAC_DRIVES_DIR, instanceId || customId || 'unknown'),
+                    'create-drive-path': 'true'
                 }
             }
         };
+
+        // Pre-create the host-side staging directory so guacd finds it ready.
+        // Docker's create-drive-path only creates paths inside the container;
+        // the host-side parent must exist before the mount is useful.
+        if (protocol === 'rdp') {
+            const driveDir = path.join(DRIVES_DIR, instanceId || customId || 'unknown');
+            fs.mkdirSync(driveDir, { recursive: true });
+        }
 
         // Encrypt the connection settings into a token
         const tokenCrypt = new Crypt(GUAC_CRYPT_CYPHER, GUAC_CRYPT_KEY);
@@ -797,6 +820,120 @@ app.post('/api/instances/:id/type', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
+// ---------------------------------------------------------------------------
+// File transfer — list, copy, and delete files in each instance's virtual
+// drive staging directory. The RDP connection above mounts DRIVES_DIR/<id>
+// as the "RDM Transfer" drive inside Windows, so anything the user drags
+// there from Explorer appears here immediately.
+// ---------------------------------------------------------------------------
+
+// Maximum file size allowed through the transfer API (500 MB).
+const MAX_FILE_BYTES = 500 * 1024 * 1024;
+
+// Resolves an instance ID to its staging directory and verifies:
+//  1. The ID contains only safe characters (alphanumeric, hyphens, underscores).
+//  2. The resolved path stays inside DRIVES_DIR (path traversal guard).
+const resolveInstanceDir = (instanceId: string): string | null => {
+    if (!/^[\w-]+$/.test(instanceId)) return null;
+    const root = path.resolve(DRIVES_DIR);
+    const dir = path.resolve(DRIVES_DIR, instanceId);
+    return dir.startsWith(root + path.sep) ? dir : null;
+};
+
+app.get('/api/files/:instanceId', (req, res) => {
+    const dir = resolveInstanceDir(req.params.instanceId);
+    if (!dir) return res.status(400).json({ error: 'Invalid instance ID' });
+    try {
+        if (!fs.existsSync(dir)) return res.json([]);
+        const entries = fs.readdirSync(dir, { withFileTypes: true })
+            .filter(e => e.isFile())
+            .map(e => {
+                const stat = fs.statSync(path.join(dir, e.name));
+                return { name: e.name, size: stat.size, modified: stat.mtime.toISOString() };
+            });
+        res.json(entries);
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/files/transfer', (req, res) => {
+    const { fromInstanceId, toInstanceId, filename } = req.body;
+    if (!fromInstanceId || !toInstanceId || !filename) {
+        return res.status(400).json({ error: 'fromInstanceId, toInstanceId, and filename are required' });
+    }
+    const fromDir = resolveInstanceDir(fromInstanceId);
+    const toDir = resolveInstanceDir(toInstanceId);
+    if (!fromDir || !toDir) return res.status(400).json({ error: 'Invalid instance ID' });
+    // Guard against path traversal in filename.
+    const safeName = path.basename(filename as string);
+    if (!safeName || safeName !== filename) {
+        return res.status(400).json({ error: 'Invalid filename' });
+    }
+    const src = path.join(fromDir, safeName);
+    const dest = path.join(toDir, safeName);
+    try {
+        if (!fs.existsSync(src)) return res.status(404).json({ error: 'Source file not found' });
+        const { size } = fs.statSync(src);
+        if (size > MAX_FILE_BYTES) {
+            return res.status(413).json({ error: `File exceeds the ${MAX_FILE_BYTES / (1024 * 1024)} MB transfer limit` });
+        }
+        fs.mkdirSync(toDir, { recursive: true });
+        fs.copyFileSync(src, dest);
+        // Delete the source only after the copy succeeds, so a failed copy
+        // never silently destroys the original.
+        fs.unlinkSync(src);
+        res.json({ success: true });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/files/:instanceId/:filename', (req, res) => {
+    const dir = resolveInstanceDir(req.params.instanceId);
+    if (!dir) return res.status(400).json({ error: 'Invalid instance ID' });
+    const safeName = path.basename(req.params.filename);
+    if (!safeName || safeName !== req.params.filename) {
+        return res.status(400).json({ error: 'Invalid filename' });
+    }
+    const filePath = path.join(dir, safeName);
+    try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        res.json({ success: true });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Fallback cleanup: delete any staged files older than 24 hours. Runs every
+// hour so files dropped into RDM Transfer but never transferred don't
+// accumulate on disk indefinitely.
+const STAGING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const STAGING_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+const cleanStagingDirs = () => {
+    if (!fs.existsSync(DRIVES_DIR)) return;
+    const now = Date.now();
+    try {
+        for (const instanceDir of fs.readdirSync(DRIVES_DIR, { withFileTypes: true })) {
+            if (!instanceDir.isDirectory()) continue;
+            const dirPath = path.join(DRIVES_DIR, instanceDir.name);
+            for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+                if (!entry.isFile()) continue;
+                const filePath = path.join(dirPath, entry.name);
+                try {
+                    const { mtimeMs } = fs.statSync(filePath);
+                    if (now - mtimeMs > STAGING_MAX_AGE_MS) fs.unlinkSync(filePath);
+                } catch {
+                    // File may have been deleted between readdir and stat — ignore.
+                }
+            }
+        }
+    } catch (err) {
+        console.error('Staging cleanup error:', err);
+    }
+};
+setInterval(cleanStagingDirs, STAGING_CLEANUP_INTERVAL_MS);
 
 // Serve the built frontend. Must come after the /api/* routes above so those
 // still take priority; the catch-all below is last so client-side routing
