@@ -61,6 +61,17 @@ function hotp(secret: Buffer, counter: number): string {
     return otp.toString().padStart(DIGITS, '0');
 }
 
+// Track recently consumed TOTP codes to prevent replay within the same window.
+// Keyed by "counter:token"; entries expire after the window they were valid for passes.
+const usedTokens = new Map<string, number>(); // key -> expiry timestamp
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, expiry] of usedTokens) {
+        if (expiry < now) usedTokens.delete(key);
+    }
+}, 60 * 1000);
+
 // 160 bits (20 bytes) — the RFC-recommended key size for HMAC-SHA1.
 export function generateSecret(): string {
     return base32Encode(crypto.randomBytes(20));
@@ -73,7 +84,13 @@ export function verifyToken(token: string, base32Secret: string): boolean {
     const tokenBuf = Buffer.from(token);
     for (let offset = -WINDOW; offset <= WINDOW; offset++) {
         const candidate = Buffer.from(hotp(secret, counter + offset));
-        if (crypto.timingSafeEqual(candidate, tokenBuf)) return true;
+        if (crypto.timingSafeEqual(candidate, tokenBuf)) {
+            const key = `${counter + offset}:${token}`;
+            if (usedTokens.has(key)) return false; // replay detected
+            // Expire after this counter step plus one window of drift
+            usedTokens.set(key, (counter + offset + WINDOW + 1) * STEP_SECONDS * 1000);
+            return true;
+        }
     }
     return false;
 }

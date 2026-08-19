@@ -6,8 +6,19 @@ import path from 'path';
 
 dotenv.config();
 
-// Key must be exactly 32 bytes for AES-256-CBC
-const DB_CRYPT_KEY = Buffer.from((process.env.GUAC_CRYPT_KEY || 'MySuperSecretKeyForGuacamoleLite').padEnd(32, '0').slice(0, 32));
+// Key must be exactly 32 bytes for AES-256-CBC.
+// Fail hard on startup if not configured — no silent insecure fallback.
+const rawCryptKey = process.env.GUAC_CRYPT_KEY;
+if (!rawCryptKey) {
+    throw new Error(
+        'GUAC_CRYPT_KEY is not set. Generate one and add it to your .env:\n' +
+        '  node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"'
+    );
+}
+if (rawCryptKey.length < 32) {
+    throw new Error('GUAC_CRYPT_KEY must be at least 32 characters long.');
+}
+const DB_CRYPT_KEY = Buffer.from(rawCryptKey.slice(0, 32));
 
 export let db: any = null;
 

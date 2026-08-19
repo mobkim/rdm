@@ -142,6 +142,7 @@ export async function attachRustDeskSession(id: string, ws: WebSocket): Promise<
 
   ws.on('message', (raw: Buffer, isBinary: boolean) => {
     if (isBinary) return;
+    if (raw.length > 64 * 1024) return; // 64 KB cap — control messages are tiny
     let msg: Record<string, unknown>;
     try {
       msg = JSON.parse(raw.toString('utf8'));

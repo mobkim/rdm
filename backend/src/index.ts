@@ -83,6 +83,17 @@ app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
 
+// Basic security headers
+app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    if (TLS_CERT && TLS_KEY) {
+        res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+    next();
+});
+
 // Auth routes are mostly public (login/setup/status) with their own rules;
 // every other /api/* route requires a session. Registration order matters —
 // requireAuth must come after authRouter so /api/auth/* isn't gated by it.
@@ -97,8 +108,8 @@ const costExplorer = new CostExplorerClient({ region: 'us-east-1' });
 // rather than the endpoint.
 const pricing = new PricingClient({ region: 'us-east-1' });
 
-// Key must be exactly 32 bytes for AES-256-CBC
-const GUAC_CRYPT_KEY = process.env.GUAC_CRYPT_KEY || 'MySuperSecretKeyForGuacamoleLite';
+// Validated at startup in db.ts — safe to assert here.
+const GUAC_CRYPT_KEY = process.env.GUAC_CRYPT_KEY!;
 const GUAC_CRYPT_CYPHER = 'AES-256-CBC';
 const USE_SSM_TUNNEL = process.env.USE_SSM_TUNNEL === 'true';
 

@@ -35,6 +35,34 @@ const PENDING_TTL_MS = 5 * 60 * 1000;
 const MAX_TOTP_ATTEMPTS = 5;
 const pendingLogins = new Map<string, PendingLogin>();
 
+// Simple in-memory rate limiter for login attempts by IP.
+// 10 attempts per 15-minute window is generous for a legitimate user but
+// stops any brute-force attempt cold.
+const RATE_WINDOW_MS = 15 * 60 * 1000;
+const RATE_MAX_ATTEMPTS = 10;
+interface RateEntry { count: number; resetAt: number; }
+const loginRates = new Map<string, RateEntry>();
+
+function isRateLimited(ip: string): boolean {
+    const now = Date.now();
+    const entry = loginRates.get(ip);
+    if (!entry || entry.resetAt < now) {
+        loginRates.set(ip, { count: 1, resetAt: now + RATE_WINDOW_MS });
+        return false;
+    }
+    if (entry.count >= RATE_MAX_ATTEMPTS) return true;
+    entry.count++;
+    return false;
+}
+
+// Periodically prune expired rate entries so the map doesn't grow forever.
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, entry] of loginRates) {
+        if (entry.resetAt < now) loginRates.delete(ip);
+    }
+}, RATE_WINDOW_MS);
+
 function cleanupPendingLogins() {
     const now = Date.now();
     for (const [token, p] of pendingLogins) {
@@ -167,9 +195,18 @@ authRouter.post('/setup', async (req, res) => {
 
 authRouter.post('/login', async (req, res) => {
     try {
+        const ip = req.ip ?? 'unknown';
+        if (isRateLimited(ip)) {
+            console.warn(`[auth] rate limit hit for login from ${ip}`);
+            return res.status(429).json({ error: 'Too many login attempts. Try again later.' });
+        }
+
         const { username, password } = req.body || {};
         const user = await getUser();
-        const invalid = () => res.status(401).json({ error: 'Invalid username or password.' });
+        const invalid = () => {
+            console.warn(`[auth] failed login attempt from ${ip}`);
+            return res.status(401).json({ error: 'Invalid username or password.' });
+        };
 
         if (!user || typeof username !== 'string' || typeof password !== 'string') return invalid();
         if (username !== user.username) return invalid();
