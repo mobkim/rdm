@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Maximize, Minimize, RefreshCw, X, GripVertical, FolderOpen } from 'lucide-react';
 import Guacamole from 'guacamole-common-js';
 import { writeDeviceClipboard } from './deviceClipboard';
@@ -9,6 +9,28 @@ interface Props {
     token: string;
     name: string;
     ip: string;
+    // Bumped by the parent whenever it switches grid layouts. That reflows
+    // this pane's cell size instantly (it's a synchronous DOM/CSS change),
+    // but this component only otherwise finds out via its own ResizeObserver
+    // on the cell — which fires a frame or more later. For an ordinary resize
+    // that lag is invisible, but a big jump (e.g. a 2x2 tile going to single
+    // view) meant the canvas visibly sat at its old, small scale for that
+    // extra frame before snapping to fill the new cell — reading as the pane
+    // "slowly" growing after the (fast, GPU-only) FLIP transform already
+    // finished. Watching this prop lets `box` be remeasured synchronously in
+    // the very same commit as the layout switch, so the canvas is already
+    // correctly scaled by the first painted frame.
+    layoutVersion?: number;
+    // False for the single-view layout: cards there render at their natural
+    // full-width 16:9 size and the page scrolls to reach the rest, rather
+    // than being shrunk to fit the available height on screen.
+    fitViewport?: boolean;
+    // Single-clicking the header toggles this pane filling the whole main
+    // content area in-page (not the OS/browser Fullscreen API — that's
+    // still the double-click/Maximize-icon behavior via onDoubleClick).
+    // Parent owns the "which pane is maximized" state since it affects the
+    // whole grid's layout, not just this pane.
+    onToggleMaximize?: () => void;
     protocol?: 'rdp' | 'vnc';
     os?: '' | 'windows' | 'macos' | 'linux';
     // Swaps Ctrl and Cmd/Meta keysyms sent to the remote — for macOS targets
@@ -38,7 +60,7 @@ interface Props {
     onFileTransfer?: () => void;
 }
 
-export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, protocol, os, swapCtrlCmd, onDisconnect, onRefresh, onError, clipboard, onClipboard, onReorderDragStart, onReorderDragEnd, onFileTransfer }) => {
+export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, layoutVersion, fitViewport = true, onToggleMaximize, protocol, os, swapCtrlCmd, onDisconnect, onRefresh, onError, clipboard, onClipboard, onReorderDragStart, onReorderDragEnd, onFileTransfer }) => {
     const rootRef = useRef<HTMLDivElement>(null);
     const headerRef = useRef<HTMLDivElement>(null);
     const displayRef = useRef<HTMLDivElement>(null);
@@ -61,6 +83,13 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, protocol, os
     // toggling it in Settings would appear to do nothing without a reconnect.
     const swapCtrlCmdRef = useRef(swapCtrlCmd);
     swapCtrlCmdRef.current = swapCtrlCmd;
+    // Read fresh inside measureBox (captured once by the mount-only
+    // ResizeObserver effect below) rather than closing over the prop
+    // directly, so an organic resize (e.g. the window resizing) after a
+    // layout switch still uses the current fitViewport instead of whatever
+    // it was when that effect first ran.
+    const fitViewportRef = useRef(fitViewport);
+    fitViewportRef.current = fitViewport;
     // Whether this session ever reached 'Connected', and whether it failed. A
     // disconnect that follows neither a failure nor a live session is the tunnel
     // dying on the way up — worth reporting, unlike a normal close.
@@ -72,29 +101,85 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, protocol, os
     // can't reliably produce a "largest fitting box" for a plain <div> when
     // height is the limiting axis.
     const [box, setBox] = useState<{ w: number; h: number } | null>(null);
+    // Set inside the connect effect below so the box-driven layout effect
+    // (which fires on every `box` change, not just reconnects) can rescale
+    // the canvas without waiting on that effect's own ResizeObserver, which
+    // — chained after the `box` state update that resizes displayRef — was
+    // arriving a frame or more late and showing bg-black through the
+    // not-yet-rescaled canvas in the meantime (most visible during rapid
+    // resizes, e.g. dragging the fill-grid zoom slider).
+    const scaleDisplayRef = useRef<() => void>(() => {});
+    // Takes an explicit size instead of measuring displayRef itself. `box` is
+    // already the exact size about to be applied to displayRef, so the
+    // box-driven layout effect below can pass it straight through — reading
+    // displayRef.clientWidth/Height back out right after every pane's box
+    // state write is a forced-synchronous-layout trap: with several panes
+    // resizing in the same commit (any grid-layout switch touches all of
+    // them), each pane's read-after-write forces the browser to flush layout
+    // for the others' pending writes too, and that thrashing is what showed
+    // up as the sessions visibly lagging behind the (GPU-only) FLIP
+    // transform during a layout switch instead of resizing with it.
+    const scaleDisplayToRef = useRef<(w: number, h: number) => void>(() => {});
 
     // Keep the display shaped exactly 16:9 and as large as its cell allows,
-    // reserving room for the static header. When the cell (or the screen, in
-    // fullscreen) resizes, recompute so the remote 1920x1080 desktop fills the
-    // display area edge-to-edge with no black bars.
+    // reserving room for the static header.
+    const measureBox = () => {
+        const cell = rootRef.current?.parentElement;
+        if (!cell) return;
+        const cw = cell.clientWidth;
+        if (cw <= 0) return;
+        let w = cw;
+        let h = (w * 9) / 16;
+        // Only shrink to fit the cell's available height when this layout
+        // wants everything visible without scrolling (2x2, fill, fullscreen).
+        // Single view instead wants the card at its natural full-width size
+        // and lets the page scroll — clamping to `ch` there is also how the
+        // old min-h-screen/auto-rows-fr combo produced its runaway-growth
+        // feedback loop: `ch` was itself derived from this same box.
+        if (fitViewportRef.current) {
+            const headerH = headerRef.current?.offsetHeight ?? 0;
+            const ch = cell.clientHeight - headerH;
+            if (ch <= 0) return;
+            if (h > ch) { h = ch; w = (h * 16) / 9; }
+        }
+        setBox({ w: Math.floor(w), h: Math.floor(h) });
+    };
+
+    // When the cell (or the screen, in fullscreen) resizes, recompute so the
+    // remote 1920x1080 desktop fills the display area edge-to-edge with no
+    // black bars.
     useEffect(() => {
         const cell = rootRef.current?.parentElement;
         if (!cell) return;
-        const measure = () => {
-            const headerH = headerRef.current?.offsetHeight ?? 0;
-            const cw = cell.clientWidth;
-            const ch = cell.clientHeight - headerH;
-            if (cw <= 0 || ch <= 0) return;
-            let w = cw;
-            let h = (w * 9) / 16;
-            if (h > ch) { h = ch; w = (h * 16) / 9; }
-            setBox({ w: Math.floor(w), h: Math.floor(h) });
-        };
-        const ro = new ResizeObserver(measure);
+        const ro = new ResizeObserver(measureBox);
         ro.observe(cell);
-        measure();
+        measureBox();
         return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    // Also remeasure synchronously whenever the parent bumps `layoutVersion`
+    // (grid layout switches) rather than waiting on the ResizeObserver above.
+    // The cell's own size already changed by the time this runs (React
+    // committed the new grid classes before layout effects fire), so this
+    // closes the gap between "the cell resized" and "this pane found out" to
+    // zero frames instead of the observer's usual one-frame-plus lag — the
+    // lag that, for a big small-to-large jump like 2x2 -> single view, showed
+    // up as the pane visibly snapping to size late, after the FLIP transform
+    // animating the cell itself had already finished.
+    useLayoutEffect(() => {
+        measureBox();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [layoutVersion]);
+
+    // Rescale synchronously (before paint) whenever `box` changes size, so the
+    // canvas is never shown at a stale scale for even one frame. This runs in
+    // the same commit as the width/height style update above, ahead of the
+    // connect effect's own ResizeObserver (which still exists as a fallback
+    // for resizes `box` doesn't drive, e.g. entering fullscreen).
+    useLayoutEffect(() => {
+        if (box) scaleDisplayToRef.current(box.w, box.h);
+    }, [box]);
 
     useEffect(() => {
         if (!displayRef.current) return;
@@ -121,18 +206,26 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, protocol, os
         displayRef.current.innerHTML = '';
         displayRef.current.appendChild(displayEl);
 
-        // Fit the remote 1920x1080 desktop to its (16:9) container. The pane is
-        // shaped 16:9 in the layout, so this fills the pane exactly with no
-        // letterboxing and no distortion.
-        const scaleDisplay = () => {
-            const container = displayRef.current;
-            if (!container || display.getWidth() === 0) return;
-            const scale = Math.min(
-                container.clientWidth / display.getWidth(),
-                container.clientHeight / display.getHeight()
-            );
+        // Fit the remote 1920x1080 desktop to a `w`x`h` box. The pane is shaped
+        // 16:9 in the layout, so this fills it exactly with no letterboxing
+        // and no distortion.
+        const scaleDisplayTo = (w: number, h: number) => {
+            if (display.getWidth() === 0 || w <= 0 || h <= 0) return;
+            const scale = Math.min(w / display.getWidth(), h / display.getHeight());
             if (scale > 0) display.scale(scale);
         };
+        scaleDisplayToRef.current = scaleDisplayTo;
+        // Fallback for resizes not driven by `box` (e.g. the container
+        // changing without the box-measuring effect having fired yet) —
+        // measures displayRef itself, so unlike scaleDisplayTo above this one
+        // does force a layout read, but it's only reached from this effect's
+        // own ResizeObserver below rather than every pane's box update.
+        const scaleDisplay = () => {
+            const container = displayRef.current;
+            if (!container) return;
+            scaleDisplayTo(container.clientWidth, container.clientHeight);
+        };
+        scaleDisplayRef.current = scaleDisplay;
 
         // Error handler
         client.onerror = (error) => {
@@ -330,6 +423,8 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, protocol, os
             window.removeEventListener('blur', handleFocusLoss);
             if (resizeObserver) resizeObserver.disconnect();
             display.onresize = null;
+            scaleDisplayRef.current = () => {};
+            scaleDisplayToRef.current = () => {};
             keyboard.onkeydown = null;
             keyboard.onkeyup = null;
             releaseAllKeys();
@@ -379,17 +474,42 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, protocol, os
         }
     };
 
+    // Single-click toggles in-page maximize; double-click still means real
+    // fullscreen. Both fire on a dblclick's first click, so the single-click
+    // action is held for a beat — long enough for a second click to cancel
+    // it — rather than firing immediately and then getting stepped on.
+    const headerClickTimer = useRef<number | null>(null);
+    const handleHeaderClick = () => {
+        if (!onToggleMaximize) return;
+        if (headerClickTimer.current !== null) return;
+        headerClickTimer.current = window.setTimeout(() => {
+            headerClickTimer.current = null;
+            onToggleMaximize();
+        }, 100);
+    };
+    const handleHeaderDoubleClick = () => {
+        if (headerClickTimer.current !== null) {
+            clearTimeout(headerClickTimer.current);
+            headerClickTimer.current = null;
+        }
+        toggleFullscreen();
+    };
+    useEffect(() => () => {
+        if (headerClickTimer.current !== null) clearTimeout(headerClickTimer.current);
+    }, []);
+
     return (
         <div
             ref={rootRef}
-            className="relative bg-slate-900 border-2 border-slate-700 rounded-lg overflow-hidden flex flex-col group focus-within:border-yellow-400 focus-within:shadow-[0_0_15px_rgba(250,204,21,0.6)] transition-[border-color,box-shadow] duration-150 max-w-full max-h-full"
+            className="relative bg-slate-900 border-2 border-slate-700 rounded-lg overflow-hidden flex flex-col group focus-within:border-yellow-400 focus-within:shadow-[0_0_15px_rgba(250,204,21,0.6)] transition-[border-color,box-shadow] duration-150 max-w-full max-h-full [contain:content]"
             style={box ? { width: box.w } : { width: '100%', height: '100%' }}
             onClick={() => displayRef.current?.focus({ preventScroll: true })}
+            onMouseEnter={() => displayRef.current?.focus({ preventScroll: true })}
         >
             {/* Static header above the session. Controls only reveal on hover
                 of the bar itself (not the whole card) so a live desktop isn't
                 permanently overlaid with buttons. */}
-            <div ref={headerRef} className="group/bar bg-slate-800 border-b border-slate-700 px-2 py-1 text-white flex justify-between items-center shrink-0 z-10">
+            <div ref={headerRef} onClick={handleHeaderClick} onDoubleClick={handleHeaderDoubleClick} className="group/bar bg-slate-800 border-b border-slate-700 px-2 py-1 text-white flex justify-between items-center shrink-0 z-10">
                 <span className="flex items-center gap-1.5 truncate">
                     <span
                         draggable

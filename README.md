@@ -1,25 +1,30 @@
 # RDm — Remote Desktop Manager
 
-Browser-based RDP and VNC access to your AWS EC2 (and custom) machines,
-streamed to the browser via [Apache Guacamole](https://guacamole.apache.org/).
-Manage many instances from one page: start/stop EC2, connect several at once
-in a grid, share the clipboard across sessions, and see your month-to-date
-AWS spend.
+Browser-based RDP, VNC, and RustDesk access to your AWS EC2 (and custom)
+machines. RDP/VNC stream to the browser via
+[Apache Guacamole](https://guacamole.apache.org/); RustDesk speaks its native
+protocol directly (see [RustDesk support](#rustdesk-support)). Manage many
+instances from one page: start/stop EC2, connect several at once in a grid,
+share the clipboard across sessions, and see your month-to-date AWS spend.
 
 ## How it works
 
 ```
 Browser (React SPA)  ──WebSocket──►  Backend (Express + guacamole-lite)  ──►  guacd (Docker)  ──RDP/VNC──►  EC2 / custom host
         │                                     │
+        │                                     └── native RustDesk client (TCP, protobuf) ──Direct IP Access──► RustDesk agent (custom host, LAN only)
         └── REST /api/* ─────────────────────►┴── AWS SDK (EC2 list/start/stop, password, Cost Explorer), optional SSM tunnel
 ```
 
 - **frontend/** — React 19 + Vite + Tailwind single-page app. Built to `frontend/dist`.
 - **backend/** — Node/TypeScript Express server. Proxies the Guacamole WebSocket
-  to `guacd`, exposes the REST API, and serves the built SPA. Stores custom
-  (non-EC2) RDP/VNC connections in a local SQLite file (`backend/rdm.sqlite`).
+  to `guacd`, speaks RustDesk's own wire protocol directly for RustDesk
+  connections (`backend/src/rustdesk/`), exposes the REST API, and serves the
+  built SPA. Stores custom (non-EC2) connections in a local SQLite file
+  (`backend/rdm.sqlite`).
 - **guacd** — the Guacamole daemon, run as a Docker container, that actually
-  speaks RDP. Listens on `127.0.0.1:4822` (hard-coded in `backend/src/index.ts`).
+  speaks RDP/VNC. Listens on `127.0.0.1:4822` (hard-coded in `backend/src/index.ts`).
+  Not involved in RustDesk connections at all.
 
 ## Prerequisites
 
@@ -248,6 +253,59 @@ hard ceiling regardless of activity.
   offered in its availability zone, so a resize can't leave you with a machine
   that won't start again. AWS only allows a resize while the instance is
   **stopped**.
+
+## RustDesk support
+
+RustDesk connections don't go through Guacamole/guacd at all — `backend/src/rustdesk/`
+is a from-scratch Node/TypeScript implementation of RustDesk's own wire
+protocol, built directly against the vendored `.proto` schema
+(`backend/src/rustdesk/proto/message.proto`, from
+[`rustdesk/hbb_common`](https://github.com/rustdesk/hbb_common)) rather than
+wrapping the RustDesk client binary.
+
+**Direct IP Access only.** It speaks straight to a RustDesk agent at
+`<ip>:21118` — no rendezvous/relay server (`hbbs`/`hbbr`) involved, and no
+NAT traversal. This mirrors what the real client does for this connection
+mode: `is_direct_ip_access()` skips both the rendezvous handshake *and* the
+NaCl/ECDH session-key exchange, so the connection is **unencrypted** on the
+wire. That's an acceptable trade-off only because the target is expected to
+be on the same trusted LAN the backend itself runs on — don't point this at
+a host over the open internet.
+
+**Pipeline:**
+- `frameCodec.ts` / `protocol.ts` — hbb_common's variable-length length-prefix
+  framing, and protobuf encode/decode via `protobufjs`.
+- `client.ts` — the actual peer connection: login handshake (salted/challenged
+  password hash), keepalive echo, mouse/keyboard/clipboard events, and cursor
+  shape/position.
+- `videoDecoder.ts` — the peer's video frames are bare libvpx VP9 (no
+  container); each gets wrapped in a minimal synthesized IVF container and
+  piped through `ffmpeg` to MJPEG, since browsers have no raw-VP9-elementary-stream
+  decoder. In practice the only codec seen in the wild is VP9 — the codec a
+  given agent build actually supports isn't something the client side can
+  change.
+- `sessionManager.ts` — bridges a browser WebSocket to a `client.ts` connection
+  + decoder, mirroring guacamole-lite's own connect/token flow (`POST
+  /api/connect` mints a short-lived session id; the actual protocol connection
+  opens once the browser's WebSocket attaches).
+- `frontend/src/RustDeskClient.tsx` — renders the incoming JPEG frames,
+  forwards mouse/keyboard/clipboard input, and draws a synthetic cursor
+  overlay (position tracked **locally** from the browser's own mouse events —
+  the peer deliberately excludes whichever connection is currently driving
+  the mouse from its position broadcasts, so relying on the server for that
+  would never receive one; cursor bitmaps arrive zstd-compressed and are
+  decompressed server-side before being handed to the browser as raw RGBA).
+
+**Setup, per target machine:** RustDesk → Settings → Network → unlock (local
+OS password) → enable **Direct IP Access**; Settings → Security → set a
+**permanent password**. Then add a custom instance in rdm with protocol
+**RustDesk**, that IP, and that password.
+
+**Limitations:** no file transfer (Guacamole's RDP/VNC path doesn't have it
+either — see [Notes & limitations](#notes--limitations) — and it's out of
+scope here too), no audio, no relay/rendezvous (LAN/direct-reachable targets
+only), and video is re-encoded to MJPEG rather than passed through natively —
+fine for a remote-admin use case, not video-call-smooth.
 
 ## Development
 

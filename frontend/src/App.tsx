@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef, useLayoutEffect } from 'react';
-import { Grid, LayoutGrid, Maximize, Square, PlayCircle, StopCircle, RefreshCw, PanelLeftClose, PanelLeftOpen, Plus, X, ChevronUp, ChevronDown, Settings, GalleryHorizontalEnd, Loader2, DollarSign, AlertTriangle, ArrowUpDown, GripVertical, Check, Cpu, LogOut, ShieldCheck, ShieldOff } from 'lucide-react';
+import { Grid, Maximize, Square, PlayCircle, StopCircle, RefreshCw, PanelLeftClose, PanelLeftOpen, Plus, X, ChevronUp, ChevronDown, Settings, GalleryHorizontalEnd, Loader2, DollarSign, AlertTriangle, ArrowUpDown, GripVertical, Check, Cpu, LogOut, ShieldCheck, ShieldOff } from 'lucide-react';
 import { GuacamoleClient } from './GuacamoleClient';
 import { FileTransferPanel } from './FileTransferPanel';
+import { RustDeskClient } from './RustDeskClient';
 import { useDeviceClipboard } from './deviceClipboard';
 import { OS_ICONS } from './OsIcons';
 import type { AuthStatus } from './Auth';
@@ -9,6 +10,147 @@ import './index.css';
 
 let toastSeq = 0;
 interface Toast { id: number; message: string; type: 'error' | 'success' | 'info'; }
+
+// Grid spacing shared by the static Tailwind gap classes and the fill-grid's
+// own inline layout math, so tiles line up with the same rhythm regardless of
+// which layout is active.
+const GRID_GAP = 4; // px, matches Tailwind's gap-1
+// Approximate rendered height of a session card's header bar (px-2 py-1,
+// text-sm + 16-20px icons, border-b). Only an estimate: each card's own
+// ResizeObserver-based sizing (see GuacamoleClient/RustDeskClient) measures
+// its *actual* header height and fits its 16:9 body to whatever's left, so a
+// few px of error here just costs a little unused space, not a broken layout.
+const CARD_HEADER_H = 30;
+
+interface FillTileLayout {
+    cols: number;
+    rows: number;
+    tileW: number;
+    tileH: number;
+    // Whether every tile fits within the container's height without needing
+    // to scroll — used to decide whether to vertically center the grid or
+    // pin it to the top so overflow scrolls naturally.
+    fitsVertically: boolean;
+}
+
+// Picks the column/row split (and resulting tile size) that fits `count`
+// same-aspect-ratio tiles into a containerW x containerH box as large as
+// possible, packing rows tightly instead of stretching them to fill height.
+function computeFillLayout(
+    containerW: number,
+    containerH: number,
+    count: number,
+    gap: number,
+    headerH: number,
+    aspect = 16 / 9
+): FillTileLayout | null {
+    if (containerW <= 0 || containerH <= 0 || count <= 0) return null;
+    let best: FillTileLayout & { area: number } | null = null;
+    for (let cols = 1; cols <= count; cols++) {
+        const rows = Math.ceil(count / cols);
+        const availW = containerW - gap * (cols - 1);
+        if (availW <= 0) continue;
+        // Always fill the row's full width for this column count — a tile
+        // that's shrunk further to fit under a height limit (below) keeps
+        // that same width rather than narrowing to match a strict 16:9 body,
+        // which is what used to leave dead margins on either side of the
+        // grid whenever a candidate was height-constrained. The remote
+        // framebuffer inside each card fits/letterboxes itself regardless of
+        // the card's exact aspect, so the card itself doesn't need to stay
+        // exactly 16:9.
+        const tileW = availW / cols;
+        const idealBodyH = tileW / aspect;
+        const idealTileH = idealBodyH + headerH;
+        const totalIdealH = idealTileH * rows + gap * (rows - 1);
+        const fitsVertically = totalIdealH <= containerH;
+        let tileH = idealTileH;
+        let bodyH = idealBodyH;
+        if (!fitsVertically) {
+            const availH = containerH - gap * (rows - 1);
+            if (availH <= 0) continue;
+            tileH = availH / rows;
+            bodyH = tileH - headerH;
+            if (bodyH <= 0) continue;
+        }
+        const area = tileW * bodyH;
+        if (!best || area > best.area) {
+            best = { cols, rows, tileW, tileH, fitsVertically, area };
+        }
+    }
+    if (!best) return null;
+    const { area: _area, ...layout } = best;
+    return layout;
+}
+
+// How many columns `count` zoomed tiles resolve to: the container width
+// divided by the zoomed target tile width, rounded to the nearest whole
+// column and clamped to [1, count].
+function colsForFillZoom(baseTileW: number, containerW: number, gap: number, count: number, zoom: number): number {
+    const idealTileW = baseTileW * zoom;
+    return Math.max(1, Math.min(count, Math.round((containerW + gap) / (idealTileW + gap))));
+}
+
+// Re-flows a fill-grid layout for the zoom slider. Rather than just scaling
+// `base`'s tiles in place (which leaves the auto-fit column count untouched,
+// so zooming out shrinks tiles but leaves the freed-up space as blank
+// margin), this re-picks the column count for the zoomed tile size and
+// stretches tiles to exactly fill the container's width at that count — so
+// zooming out packs more of the same sessions into each row instead of
+// leaving deadspace, and zooming in packs fewer/bigger ones (typically
+// overflowing into a scroll, which is the point of zooming in).
+function applyFillZoom(
+    base: FillTileLayout,
+    containerW: number,
+    containerH: number,
+    count: number,
+    gap: number,
+    headerH: number,
+    zoom: number,
+    aspect = 16 / 9
+): FillTileLayout {
+    // Deliberately no `zoom === 1` shortcut back to `base`: colsForFillZoom
+    // already resolves to the same column count as `base` at zoom 1 (it's
+    // the same math `base.tileW` came from), but `base` additionally caps
+    // tile height to fit the container without scrolling, while this
+    // function's tileH below never does (an overflowing scroll is the point
+    // of zooming in). The zoom slider's max is floored at 1 (see
+    // fillZoomBounds), so it routinely sits exactly at zoom === 1 — shortcut
+    // here meant the layout snapped from this "may-overflow" tile size back
+    // to `base`'s "capped-to-fit" one right at the top of the drag.
+    if (containerW <= 0) return base;
+    const cols = colsForFillZoom(base.tileW, containerW, gap, count, zoom);
+    const rows = Math.ceil(count / cols);
+    const tileW = (containerW - gap * (cols - 1)) / cols;
+    const bodyH = tileW / aspect;
+    const tileH = bodyH + headerH;
+    const fitsVertically = rows * tileH + gap * (rows - 1) <= containerH;
+    return { cols, rows, tileW, tileH, fitsVertically };
+}
+
+// The zoom slider's usable min/max: past either end, colsForFillZoom has
+// already saturated at `count` columns (fully zoomed out) or 1 column (fully
+// zoomed in), so tileW stops changing and further dragging does nothing. A
+// fixed min/max either left most of the slider dead or cut off before
+// reaching 1-2 columns, depending on session count and window width — so
+// derive it from those instead: solve colsForFillZoom's rounding boundary for
+// the zoom where it crosses into the 1-column and count-column buckets.
+function fillZoomBounds(base: FillTileLayout, containerW: number, gap: number, count: number): { min: number; max: number } {
+    if (containerW <= 0 || base.tileW <= 0 || count <= 1) return { min: 0.5, max: 1.3 };
+    const zoomAtBoundary = (n: number) => ((containerW + gap) / n - gap) / base.tileW;
+    // Small multipliers nudge past the exact rounding boundary so the ends of
+    // the slider reliably reach 1 column / `count` columns rather than
+    // landing right on the edge where floating point could round either way.
+    // Deliberately no Math.max(1, ...) / Math.min(1, ...) floor-to-1 here
+    // (unlike an earlier version): forcing the range to always straddle
+    // zoom = 1 stretched a dead tail onto whichever end didn't actually need
+    // it — e.g. once the true "reaches 1 column" boundary sits below zoom 1,
+    // flooring `max` at 1 anyway left the back half of the slider doing
+    // nothing, which is the "past 50% zoom is the same thing" symptom this
+    // was tuned to fix.
+    const max = Math.max(0.05, zoomAtBoundary(1.5) * 1.02);
+    const min = Math.max(0.05, Math.min(zoomAtBoundary(count - 0.5) * 0.98, max - 0.01));
+    return { min, max };
+}
 
 interface EC2Instance {
     id: string;
@@ -126,6 +268,191 @@ const OsIcon = ({ os, size = 13, className = '' }: { os?: string; size?: number;
     return <Icon size={size} className={className} aria-label={label} />;
 };
 
+// Session-picker strip docked beside (horizontal scroll) or below (single
+// view) the session area — see SessionPicker below: a row/column of small
+// rectangles, one per connected session, that let you jump straight to one
+// instead of scrolling past every pane in between.
+const PICKER_ASPECT = 16 / 9; // matches a real desktop's shape, not a square
+const PICKER_MAX = 56; // px, rectangle height at or below this session count
+const PICKER_MIN = 20; // px, never shrink the rectangle's height smaller than
+                        // this — beyond this point they overlap/clip instead
+                        // of shrinking further
+const PICKER_GAP = 8; // px, matches Tailwind's gap-2
+// Internal bitmap resolution each rectangle's thumbnail canvas is captured
+// at — fixed rather than tracking the rendered size so a resize doesn't
+// force every thumbnail to reallocate its backing bitmap on every render.
+const PICKER_CANVAS_W = 160;
+const PICKER_CANVAS_H = PICKER_CANVAS_W / PICKER_ASPECT;
+// How often each rectangle redraws from its session's live canvas/img —
+// cheap (a single drawImage of an already-rendered element, not a second
+// connection) but frequent enough to read as "live" rather than a snapshot.
+const PICKER_CAPTURE_MS = 700;
+
+// The browser's scrollbar thickness, measured once and cached. `scrollbar-
+// gutter: stable` (used for the picker's right-dock/vertical-scroll case
+// below) only reserves space for a *vertical* scrollbar — there's no CSS
+// equivalent for a horizontal one, so the bottom-dock/horizontal-scroll case
+// reserves it manually via padding sized from this measurement instead.
+// Returns 0 on overlay-scrollbar systems (macOS default, etc.), same as
+// scrollbar-gutter would.
+let cachedScrollbarSize: number | null = null;
+function getScrollbarSize(): number {
+    if (cachedScrollbarSize !== null) return cachedScrollbarSize;
+    // Probes with the same overflow-y + scrollbar-gutter:stable combination
+    // the right-dock strip actually uses, rather than a plain `overflow:
+    // scroll` div — stable's reserved width is spec'd to hold steady at the
+    // platform's classic (non-overlay) scrollbar metric specifically so
+    // overlay-scrollbar systems don't report 0 here and then reserve nothing
+    // for the axis CSS can't cover (see below).
+    const probe = document.createElement('div');
+    probe.style.cssText = 'position:absolute; top:-9999px; width:100px; height:100px; overflow-y:scroll; scrollbar-gutter:stable;';
+    document.body.appendChild(probe);
+    cachedScrollbarSize = probe.offsetWidth - probe.clientWidth;
+    document.body.removeChild(probe);
+    return cachedScrollbarSize;
+}
+
+// Shrinks the picker's rectangles so `count` of them (plus gaps) fit within
+// `available` px along the strip's stacking axis, instead of overflowing the
+// strip off the edge of the window once enough sessions are connected.
+// Always solves for the rectangle's *height* — for a horizontal (bottom-dock)
+// strip that axis is width, so there each rectangle's on-axis footprint is
+// its width (height * aspect), not its height directly.
+function pickerItemHeight(available: number, count: number, orientation: 'right' | 'bottom'): number {
+    if (count <= 0) return PICKER_MAX;
+    if (available <= 0) return PICKER_MIN;
+    const perItemMain = orientation === 'right' ? 1 : PICKER_ASPECT;
+    const fit = (available - PICKER_GAP * (count - 1)) / count / perItemMain;
+    return Math.max(PICKER_MIN, Math.min(PICKER_MAX, fit));
+}
+
+// Center-crop draws `source` into `ctx` the way CSS `object-fit: cover`
+// would, instead of squashing a captured frame to fit the thumbnail exactly.
+function drawCover(ctx: CanvasRenderingContext2D, source: CanvasImageSource, sw: number, sh: number, dw: number, dh: number) {
+    if (sw <= 0 || sh <= 0) return;
+    const sourceAspect = sw / sh;
+    const destAspect = dw / dh;
+    let cropW = sw, cropH = sh, cropX = 0, cropY = 0;
+    if (sourceAspect > destAspect) {
+        cropW = sh * destAspect;
+        cropX = (sw - cropW) / 2;
+    } else {
+        cropH = sw / destAspect;
+        cropY = (sh - cropH) / 2;
+    }
+    ctx.drawImage(source, cropX, cropY, cropW, cropH, 0, 0, dw, dh);
+}
+
+// Docked beside the session area (right of horizontal scroll, bottom of
+// single view — see the `pickerActive` flex wrapper in App below): a strip
+// of small 16:9 rectangles, one per connected session, centered along the
+// dock and growing outward as more connect. Each rectangle is a live
+// thumbnail of that session's actual screen (redrawn from its own canvas/img
+// on an interval — see `getSourceEl`), not a static icon, so it reads as a
+// mini-map. Hovering one reveals the instance's name via a custom tooltip
+// (native `title` tooltips are deliberately not used — they'd double up with
+// this one); clicking scrolls that session's pane into view.
+//
+// The strip itself scrolls (rather than shrinking rectangles indefinitely)
+// once enough sessions connect that even PICKER_MIN-sized ones don't all
+// fit — e.g. 100 sessions at the floor size still need ~2800px, far more
+// than any real window. That means the tooltip can't be a plain CSS
+// `position: absolute` descendant of the scrolling strip (it'd just get
+// clipped by the strip's own overflow, same as when it was positioned
+// relative to the dock before that had scrolling); it's `position: fixed`
+// and JS-positioned from the hovered button's rect instead, which escapes
+// the strip's overflow clipping entirely.
+const SessionPicker = ({ sessions, orientation, itemHeight, onJump, getSourceEl }: {
+    sessions: { id: string; name: string }[];
+    orientation: 'right' | 'bottom';
+    itemHeight: number;
+    onJump: (id: string) => void;
+    getSourceEl: (id: string) => HTMLCanvasElement | HTMLImageElement | null;
+}) => {
+    const isRight = orientation === 'right';
+    const itemWidth = itemHeight * PICKER_ASPECT;
+    const canvasRefs = useRef<Record<string, HTMLCanvasElement | null>>({});
+    const [hovered, setHovered] = useState<{ id: string; name: string; rect: DOMRect } | null>(null);
+    const sessionIds = sessions.map(s => s.id).join(',');
+    useEffect(() => {
+        const capture = () => {
+            for (const id of sessionIds ? sessionIds.split(',') : []) {
+                const canvas = canvasRefs.current[id];
+                const source = getSourceEl(id);
+                const ctx = canvas?.getContext('2d');
+                if (!canvas || !source || !ctx) continue;
+                const sw = source instanceof HTMLCanvasElement ? source.width : source.naturalWidth;
+                const sh = source instanceof HTMLCanvasElement ? source.height : source.naturalHeight;
+                if (sw <= 0 || sh <= 0) continue;
+                try {
+                    drawCover(ctx, source, sw, sh, canvas.width, canvas.height);
+                } catch {
+                    // Source not decodable this tick (e.g. mid-reconnect) — leave
+                    // the last good frame on screen and try again next tick.
+                }
+            }
+        };
+        capture();
+        const interval = setInterval(capture, PICKER_CAPTURE_MS);
+        return () => clearInterval(interval);
+    }, [sessionIds, getSourceEl]);
+    return (
+        <>
+            <div
+                // Reserves the scrollbar's space whether or not it's actually
+                // showing, rather than letting a classic (non-overlay)
+                // scrollbar paint on top of the rightmost/bottommost card —
+                // scrollbar-gutter:stable does this natively for the
+                // vertical-scrollbar (right-dock) case, same technique as the
+                // main content area's own scroll container; there's no CSS
+                // equivalent for a horizontal scrollbar, so the bottom-dock
+                // case reserves it manually via padding instead (see
+                // getScrollbarSize).
+                className={`flex ${isRight ? 'flex-col max-h-full overflow-y-auto [scrollbar-gutter:stable]' : 'flex-row max-w-full overflow-x-auto'}`}
+                style={{ gap: PICKER_GAP, ...(isRight ? null : { paddingBottom: getScrollbarSize() }) }}
+                // Scrolling moves the hovered button out from under its
+                // captured rect without a fresh mouseenter to update it —
+                // close the tooltip rather than let it drift stale.
+                onScroll={() => setHovered(null)}
+            >
+                {sessions.map(s => (
+                    <button
+                        key={s.id}
+                        onClick={() => onJump(s.id)}
+                        onMouseEnter={(e) => setHovered({ id: s.id, name: s.name, rect: e.currentTarget.getBoundingClientRect() })}
+                        onMouseLeave={() => setHovered(h => (h?.id === s.id ? null : h))}
+                        style={{ width: itemWidth, height: itemHeight }}
+                        className="block shrink-0 overflow-hidden rounded border border-slate-600 bg-slate-800/90 shadow-lg hover:border-blue-400 transition-colors"
+                    >
+                        <canvas
+                            ref={(el) => { canvasRefs.current[s.id] = el; }}
+                            width={PICKER_CANVAS_W}
+                            height={PICKER_CANVAS_H}
+                            className="w-full h-full"
+                        />
+                    </button>
+                ))}
+            </div>
+            {hovered && (
+                <div
+                    className="pointer-events-none fixed z-50 whitespace-nowrap rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 shadow-lg"
+                    style={isRight ? {
+                        right: window.innerWidth - hovered.rect.left + 8,
+                        top: hovered.rect.top + hovered.rect.height / 2,
+                        transform: 'translateY(-50%)',
+                    } : {
+                        bottom: window.innerHeight - hovered.rect.top + 8,
+                        left: hovered.rect.left + hovered.rect.width / 2,
+                        transform: 'translateX(-50%)',
+                    }}
+                >
+                    {hovered.name}
+                </div>
+            )}
+        </>
+    );
+};
+
 interface ActiveSession {
     instanceId: string;
     token: string;
@@ -133,16 +460,35 @@ interface ActiveSession {
     ip: string;
 }
 
+type Protocol = 'rdp' | 'vnc' | 'rustdesk';
+
 interface CustomInstance {
     id: string;
     name: string;
     ip: string;
-    username: string;
-    protocol?: 'rdp' | 'vnc';
-    hasPassword?: boolean;
+    protocol?: Protocol;
     os?: '' | 'windows' | 'macos' | 'linux';
     swapKeys?: boolean;
+    // Each protocol keeps its own credentials — RustDesk has no username.
+    rdpUsername?: string;
+    rdpHasPassword?: boolean;
+    vncUsername?: string;
+    vncHasPassword?: boolean;
+    rustdeskHasPassword?: boolean;
 }
+
+// Pulls whichever protocol's saved username/hasPassword out of a CustomInstance.
+const credsForProtocol = (inst: CustomInstance, protocol: Protocol): { username: string; hasPassword: boolean } => {
+    switch (protocol) {
+        case 'vnc':
+            return { username: inst.vncUsername || 'Administrator', hasPassword: !!inst.vncHasPassword };
+        case 'rustdesk':
+            return { username: '', hasPassword: !!inst.rustdeskHasPassword };
+        case 'rdp':
+        default:
+            return { username: inst.rdpUsername || 'Administrator', hasPassword: !!inst.rdpHasPassword };
+    }
+};
 
 interface Billing {
     available: boolean;
@@ -304,14 +650,14 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
     // Explicit render order for the grid, so panes can be dragged to reorder.
     // Persisted to localStorage so an arrangement survives reloads/reconnects.
     const [sessionOrder, setSessionOrder] = useState<string[]>(() => {
-        try { return JSON.parse(localStorage.getItem('rdpm_order') || '[]'); } catch { return []; }
+        try { return JSON.parse(localStorage.getItem('rdm_order') || '[]'); } catch { return []; }
     });
     // Dedicated full-view reorder mode: minimizes every session into compact,
     // easily-draggable tiles so ordering works regardless of the grid layout.
     const [reorderMode, setReorderMode] = useState(false);
     // Transient notifications (connection failures, etc.).
     const [toasts, setToasts] = useState<Toast[]>([]);
-    const [gridLayout, setGridLayout] = useState<number>(2); // 1 = 1x1, 2 = 2x2, 4 = 4x4
+    const [gridLayout, setGridLayout] = useState<number>(4); // 1 = single view, 3 = horizontal, 4 = grid (fill)
     // FLIP-animate grid-layout switches: CSS can't reliably interpolate a
     // reflow that changes grid-template-columns/rows (or swaps grid<->flex
     // for horizontal scroll) — depending on direction and magnitude, browsers
@@ -322,6 +668,112 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
     // always interpolable, regardless of what layout changed underneath.
     const gridCellRefs = useRef<Record<string, HTMLDivElement | null>>({});
     const pendingFlipRects = useRef<Record<string, DOMRect> | null>(null);
+    // Fill layout (gridLayout === 4): tracks the grid container's own size so
+    // computeFillLayout can pick the tile count/size that best fills it. A
+    // callback ref (rather than useRef + a mount-only effect) because this
+    // element only exists while gridLayout === 4 and orderedSessions is
+    // non-empty — it unmounts/remounts as those flip, and each mount needs
+    // its own ResizeObserver rather than one wired up only on first render.
+    const [fillContainerSize, setFillContainerSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+    // Zoom multiplier applied on top of computeFillLayout's auto-fit tile
+    // size (1 = auto-fit, unchanged from before this existed). Adjustable via
+    // the popup slider shown when the Grid button is clicked.
+    const [fillZoom, setFillZoom] = useState(1);
+    const [showFillZoomSlider, setShowFillZoomSlider] = useState(false);
+    // Hide the zoom popup the instant the user leaves Grid for another
+    // layout — it otherwise only closed on the popup's own onMouseLeave,
+    // which doesn't fire just because the layout changed under it.
+    useEffect(() => {
+        if (gridLayout !== 4) setShowFillZoomSlider(false);
+    }, [gridLayout]);
+    // Session-picker strip (see SessionPicker) docked beside single view (1,
+    // already a vertical scroll of full-width panes — no separate "vertical"
+    // layout needed) or horizontal scroll (3). A toggle rather than
+    // always-on: clicking the already-active layout's button flips it,
+    // clicking into a different scroll layout shows it fresh — mirrors the
+    // Grid zoom popup above.
+    const [showSessionPicker, setShowSessionPicker] = useState(false);
+    useEffect(() => {
+        if (gridLayout !== 1 && gridLayout !== 3) setShowSessionPicker(false);
+    }, [gridLayout]);
+    // Last render's zoom bounds, so the pin-to-edge effect below can tell
+    // whether fillZoom was sitting at the old min/max (see that effect).
+    const fillZoomBoundsPrev = useRef<{ min: number; max: number }>({ min: 0.5, max: 1.3 });
+    // Single-clicking a pane's header "maximizes" it to fill the whole main
+    // content area in-page, on top of whatever grid layout is active — the
+    // other panes stay mounted (just hidden) so their sessions don't drop.
+    // Click the header again (same instanceId) to restore.
+    const [maximizedId, setMaximizedId] = useState<string | null>(null);
+    // If the maximized session disconnects on its own (tunnel error, guacd
+    // dropping, etc. — anything that removes it from activeSessions without
+    // going through the header click), maximizedId would otherwise keep
+    // pointing at a pane that no longer exists. Every *other* pane's
+    // isHiddenByMaximize check only looks at "is maximizedId set", not
+    // "does it still resolve to a live session" — so the whole grid stayed
+    // hidden behind nothing, reading as a black screen until reload.
+    useEffect(() => {
+        if (maximizedId && !activeSessions[maximizedId]) setMaximizedId(null);
+    }, [maximizedId, activeSessions]);
+    // Maximizing hides every other pane, which collapses <main>'s scrollable
+    // content down to just the maximized pane — the browser then clamps
+    // scrollTop to fit (usually to 0), same as any element whose content
+    // shrinks. Restoring afterwards regrows the content back to its full
+    // height, but the browser has no memory of where scrollTop "should" be,
+    // so it stayed wherever the collapse left it — always the top. Save (see
+    // toggleMaximize below, which captures it *before* the collapse) and
+    // restore it ourselves across the toggle instead.
+    // The outer <main> — used only to measure the box the session area and
+    // the docked session-picker strip (SessionPicker) share, via mainSize
+    // below. The actual scrolling happens in contentScrollRef's div (see
+    // render): docking the picker strip as a flex sibling rather than an
+    // overlay means <main> itself no longer scrolls.
+    const mainRef = useRef<HTMLElement | null>(null);
+    const contentScrollRef = useRef<HTMLDivElement | null>(null);
+    const savedMainScrollTop = useRef(0);
+    const wasMaximized = useRef(false);
+    // <main>'s own content-box size, used to size/fit the session-picker
+    // strip (SessionPicker) to whatever room the window actually has. Shared
+    // by both docked orientations since docking the strip as a flex sibling
+    // only redistributes space along the strip's own axis — the box's other
+    // dimension (main's height for the right dock, its width for the bottom
+    // dock) is unaffected by whether the strip is showing.
+    const [mainSize, setMainSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+    useEffect(() => {
+        const el = mainRef.current;
+        if (!el) return;
+        const measure = () => setMainSize({ w: el.clientWidth, h: el.clientHeight });
+        const ro = new ResizeObserver(measure);
+        ro.observe(el);
+        measure();
+        return () => ro.disconnect();
+    }, []);
+    useLayoutEffect(() => {
+        const isMaximized = maximizedId !== null;
+        if (wasMaximized.current && !isMaximized && contentScrollRef.current) {
+            contentScrollRef.current.scrollTop = savedMainScrollTop.current;
+        }
+        wasMaximized.current = isMaximized;
+    }, [maximizedId]);
+    // GuacamoleClient/RustDeskClient's `layoutVersion` prop needs to bump for
+    // *any* change that resizes a pane's cell outside its own ResizeObserver
+    // — that's every gridLayout switch, but now also maximize/restore, since
+    // hiding a pane's siblings (or un-hiding them) reflows the grid the same
+    // way a layout switch does.
+    const [resizeSignal, setResizeSignal] = useState(0);
+    useEffect(() => {
+        setResizeSignal(s => s + 1);
+    }, [gridLayout, maximizedId]);
+    const fillResizeObserver = useRef<ResizeObserver | null>(null);
+    const setFillGridRef = useCallback((el: HTMLDivElement | null) => {
+        fillResizeObserver.current?.disconnect();
+        fillResizeObserver.current = null;
+        if (!el) return;
+        const measure = () => setFillContainerSize({ w: el.clientWidth, h: el.clientHeight });
+        const ro = new ResizeObserver(measure);
+        ro.observe(el);
+        fillResizeObserver.current = ro;
+        measure();
+    }, []);
     const changeGridLayout = (next: number) => {
         const rects: Record<string, DOMRect> = {};
         for (const [id, el] of Object.entries(gridCellRefs.current)) {
@@ -330,6 +782,37 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         pendingFlipRects.current = rects;
         setGridLayout(next);
     };
+    // Single View/Horizontal buttons double as the session-picker toggle:
+    // switching into that layout shows the picker, clicking it again while
+    // already there flips it off (and back on).
+    const toggleScrollPicker = (layout: number) => {
+        if (gridLayout === layout) {
+            setShowSessionPicker(v => !v);
+        } else {
+            changeGridLayout(layout);
+            setShowSessionPicker(true);
+        }
+    };
+    const jumpToSession = (id: string) => {
+        gridCellRefs.current[id]?.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+    };
+    // The picker's per-square thumbnail source: whichever element inside a
+    // session's tile actually holds its rendered frame — Guacamole stacks
+    // multiple <canvas> layers (desktop + a small cursor overlay), so pick
+    // the largest by backing-store area; RustDeskClient instead paints into
+    // an <img>. Read via gridCellRefs rather than threading a ref through
+    // GuacamoleClient/RustDeskClient, since the tile wrapper already has one.
+    const getSessionSourceEl = useCallback((id: string): HTMLCanvasElement | HTMLImageElement | null => {
+        const container = gridCellRefs.current[id];
+        if (!container) return null;
+        const canvases = container.querySelectorAll('canvas');
+        if (canvases.length > 0) {
+            let best = canvases[0];
+            canvases.forEach(c => { if (c.width * c.height > best.width * best.height) best = c; });
+            return best;
+        }
+        return container.querySelector('img');
+    }, []);
     useLayoutEffect(() => {
         const before = pendingFlipRects.current;
         pendingFlipRects.current = null;
@@ -349,7 +832,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
             el.style.transform = `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`;
             el.getBoundingClientRect(); // force the browser to register the "from" state
             requestAnimationFrame(() => {
-                el.style.transition = 'transform 200ms ease-out';
+                el.style.transition = 'transform 60ms ease-out';
                 el.style.transform = '';
             });
             el.addEventListener('transitionend', () => {
@@ -359,12 +842,16 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
             }, { once: true });
         }
     }, [gridLayout]);
-    const [isSidebarVisible, setIsSidebarVisible] = useState<boolean>(() => {
-        const stored = localStorage.getItem('rdpm_sidebar');
+    // The user's remembered preference — only changed by explicit clicks on the
+    // show/hide sidebar buttons. The actually-rendered visibility (below, near
+    // activeSessionList) additionally forces the sidebar open whenever no
+    // sessions are active, without touching this stored preference.
+    const [sidebarPref, setSidebarPref] = useState<boolean>(() => {
+        const stored = localStorage.getItem('rdm_sidebar');
         return stored !== null ? stored === 'true' : true;
     });
     const [isHeaderVisible, setIsHeaderVisible] = useState<boolean>(() => {
-        const stored = localStorage.getItem('rdpm_header');
+        const stored = localStorage.getItem('rdm_header');
         return stored !== null ? stored === 'true' : true;
     });
     const [loading, setLoading] = useState(false);
@@ -401,10 +888,19 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
 
     // Instance add/edit modal + its form.
     const [instanceModal, setInstanceModal] = useState<InstanceModal | null>(null);
+    // `savedCreds` holds each protocol's already-saved username/hasPassword for
+    // the instance being edited, so switching the protocol dropdown shows that
+    // protocol's own stored state instead of leaking another protocol's values.
+    const emptyCreds = (): Record<Protocol, { username: string; hasPassword: boolean }> => ({
+        rdp: { username: 'Administrator', hasPassword: false },
+        vnc: { username: 'Administrator', hasPassword: false },
+        rustdesk: { username: '', hasPassword: false }
+    });
     const [instanceForm, setInstanceForm] = useState({
-        name: '', ip: '', username: 'Administrator', protocol: 'rdp' as 'rdp' | 'vnc',
+        name: '', ip: '', username: 'Administrator', protocol: 'rdp' as Protocol,
         os: '' as '' | 'windows' | 'macos' | 'linux', swapKeys: false,
-        password: '', changePassword: false, hasPassword: false
+        password: '', changePassword: false, hasPassword: false,
+        savedCreds: emptyCreds()
     });
 
     // Reusable confirmation dialog (used for every stop action).
@@ -661,22 +1157,22 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         fetchInstances();
         fetchCustomInstances();
         fetchBilling();
-        const storedSettings = localStorage.getItem('rdpm_settings');
+        const storedSettings = localStorage.getItem('rdm_settings');
         if (storedSettings) {
             try { setGlobalSettings(JSON.parse(storedSettings)); } catch(e){}
         }
     }, []);
 
     // Session persistence: sessionStorage tracks which sessions were open;
-    // localStorage ('rdpm_order') remembers their arrangement across reloads.
+    // localStorage ('rdm_order') remembers their arrangement across reloads.
     useEffect(() => {
         if (!hasRestored) {
-            const stored = sessionStorage.getItem('rdpm_active_sessions');
+            const stored = sessionStorage.getItem('rdm_active_sessions');
             if (stored) {
                 try {
                     const activeIds: string[] = JSON.parse(stored);
                     const remembered: string[] = (() => {
-                        try { return JSON.parse(localStorage.getItem('rdpm_order') || '[]'); } catch { return []; }
+                        try { return JSON.parse(localStorage.getItem('rdm_order') || '[]'); } catch { return []; }
                     })();
                     // Reconnect in the remembered order; append any that weren't ranked.
                     const ordered = [
@@ -688,22 +1184,22 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
             }
             setHasRestored(true);
         } else {
-            sessionStorage.setItem('rdpm_active_sessions', JSON.stringify(Object.keys(activeSessions)));
+            sessionStorage.setItem('rdm_active_sessions', JSON.stringify(Object.keys(activeSessions)));
         }
     }, [activeSessions, hasRestored]);
 
     // Remember the arrangement.
     useEffect(() => {
-        localStorage.setItem('rdpm_order', JSON.stringify(sessionOrder));
+        localStorage.setItem('rdm_order', JSON.stringify(sessionOrder));
     }, [sessionOrder]);
 
     // UI State persistence
     useEffect(() => {
-        localStorage.setItem('rdpm_sidebar', isSidebarVisible.toString());
-    }, [isSidebarVisible]);
+        localStorage.setItem('rdm_sidebar', sidebarPref.toString());
+    }, [sidebarPref]);
 
     useEffect(() => {
-        localStorage.setItem('rdpm_header', isHeaderVisible.toString());
+        localStorage.setItem('rdm_header', isHeaderVisible.toString());
     }, [isHeaderVisible]);
 
     // An instance counts as transitioning while we're waiting on a start/stop we
@@ -823,7 +1319,11 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                 ...prev,
                 [instanceId]: {
                     instanceId,
-                    token: data.token,
+                    // RustDesk connections return a sessionId instead of a
+                    // guacamole-lite token (see POST /api/connect) — both flow
+                    // through this same `token` field since GuacamoleClient and
+                    // RustDeskClient share the prop contract.
+                    token: data.token ?? data.sessionId,
                     name,
                     ip
                 }
@@ -859,7 +1359,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
             });
             if (!res.ok) throw new Error(await readErrorMessage(res));
             const data = await res.json();
-            setActiveSessions(prev => prev[instanceId] ? { ...prev, [instanceId]: { ...prev[instanceId], token: data.token } } : prev);
+            setActiveSessions(prev => prev[instanceId] ? { ...prev, [instanceId]: { ...prev[instanceId], token: data.token ?? data.sessionId } } : prev);
         } catch (err: any) {
             const reason = (err?.message || 'Unknown error').toString().trim();
             const label = instances.find(i => i.id === instanceId)?.name
@@ -871,12 +1371,19 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
 
     // Open the add/edit modal, prefilled for the target.
     const openAddModal = () => {
-        setInstanceForm({ name: '', ip: '', username: 'Administrator', protocol: 'rdp', os: '', swapKeys: false, password: '', changePassword: true, hasPassword: false });
+        setInstanceForm({ name: '', ip: '', username: 'Administrator', protocol: 'rdp', os: '', swapKeys: false, password: '', changePassword: true, hasPassword: false, savedCreds: emptyCreds() });
         setInstanceModal({ mode: 'add' });
     };
 
     const openEditCustom = (inst: CustomInstance) => {
-        setInstanceForm({ name: inst.name, ip: inst.ip, username: inst.username || 'Administrator', protocol: inst.protocol || 'rdp', os: inst.os || '', swapKeys: !!inst.swapKeys, password: '', changePassword: false, hasPassword: !!inst.hasPassword });
+        const protocol = inst.protocol || 'rdp';
+        const savedCreds: Record<Protocol, { username: string; hasPassword: boolean }> = {
+            rdp: credsForProtocol(inst, 'rdp'),
+            vnc: credsForProtocol(inst, 'vnc'),
+            rustdesk: credsForProtocol(inst, 'rustdesk')
+        };
+        const current = savedCreds[protocol];
+        setInstanceForm({ name: inst.name, ip: inst.ip, username: current.username, protocol, os: inst.os || '', swapKeys: !!inst.swapKeys, password: '', changePassword: false, hasPassword: current.hasPassword, savedCreds });
         setInstanceModal({ mode: 'edit-custom', id: inst.id });
     };
 
@@ -887,7 +1394,8 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
             username: inst.username || 'Administrator',
             protocol: 'rdp',
             os: inst.os || '', swapKeys: !!inst.swapKeys,
-            password: '', changePassword: false, hasPassword: !!inst.hasPassword
+            password: '', changePassword: false, hasPassword: !!inst.hasPassword,
+            savedCreds: emptyCreds()
         });
         setInstanceModal({ mode: 'edit-ec2', id: inst.id });
     };
@@ -1241,20 +1749,166 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
 
     const getGridClass = () => {
         switch (gridLayout) {
-            case 1: return 'grid grid-cols-1 auto-rows-fr';
-            case 2: return 'grid grid-cols-1 md:grid-cols-2 auto-rows-fr';
+            // Single view: rows are sized to each card's own natural (full-width,
+            // 16:9) height rather than squeezed to an equal auto-rows-fr share of
+            // the viewport — the cards should render full size and the page
+            // scrolls to reach the rest, not shrink to fit them all on screen.
+            // Except with the session picker docked (singleViewFit): then each
+            // card instead shrinks to fill the (now smaller) available height,
+            // same as the other layouts — see the picker's own comment.
+            case 1: return singleViewFit ? 'flex flex-col' : 'grid grid-cols-1';
             case 3: return 'flex overflow-x-auto snap-x snap-mandatory'; // Horizontal
-            case 4: return 'grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 auto-rows-fr';
-            default: return 'grid grid-cols-1 auto-rows-fr';
+            // Fill/Grid: column/row count and tile size are computed dynamically
+            // (see computeFillLayout) and applied via inline style below, so
+            // no Tailwind grid-cols/rows classes are needed here.
+            case 4: return 'grid';
+            default: return 'grid grid-cols-1';
         }
     };
 
     const activeSessionList = Object.values(activeSessions);
+    // Force the sidebar open whenever nothing is in view, regardless of the
+    // stored preference; falls back to that preference once a session exists.
+    const isSidebarVisible = sidebarPref || activeSessionList.length === 0;
     // Render in explicit drag order; ignore ids no longer connected.
     const orderedSessions = sessionOrder.map(id => activeSessions[id]).filter(Boolean) as ActiveSession[];
+    // Name for the session-picker strip's tooltips — resolved the same way
+    // renderSessionTile resolves each card's own header.
+    const pickerSessions = orderedSessions.map(s => {
+        const custom = customInstances.find(c => c.id === s.instanceId);
+        const ec2 = instances.find(i => i.id === s.instanceId);
+        return {
+            id: s.instanceId,
+            name: custom?.name || ec2?.label || ec2?.name || s.name,
+        };
+    });
+    // Docked beside single view (bottom) or horizontal scroll (right) — not
+    // over it, so the session area itself shrinks to make room instead of
+    // the strip overlapping any pane. See the pickerActive flex wrapper below.
+    const pickerActive = showSessionPicker && (gridLayout === 1 || gridLayout === 3) && pickerSessions.length > 1;
+    // Available room for the picker strip along the edge it hugs — right
+    // edge's height for horizontal scroll, bottom edge's width for single
+    // view — minus a little margin so it never touches the container's corners.
+    const pickerAvailable = gridLayout === 3 ? mainSize.h - 48 : mainSize.w - 48;
+    const pickerItemH = pickerItemHeight(pickerAvailable, orderedSessions.length, gridLayout === 3 ? 'right' : 'bottom');
+    // Single view's cards normally render at their natural full-width size
+    // and let the page scroll to reach the rest (see the comment on the grid
+    // container below) — but with the picker docked at the bottom, that
+    // leaves less vertical room and the "current" card would just overflow
+    // further instead of shrinking to fit. Switch it to the same
+    // shrink-to-fit sizing the other layouts use whenever the picker's up.
+    const singleViewFit = gridLayout === 1 && pickerActive;
+    const autoFillLayout = gridLayout === 4
+        ? computeFillLayout(fillContainerSize.w, fillContainerSize.h, orderedSessions.length, GRID_GAP, CARD_HEADER_H)
+        : null;
+    const fillLayout = autoFillLayout
+        ? applyFillZoom(autoFillLayout, fillContainerSize.w, fillContainerSize.h, orderedSessions.length, GRID_GAP, CARD_HEADER_H, fillZoom)
+        : null;
+    const fillZoomBoundsVal = autoFillLayout
+        ? fillZoomBounds(autoFillLayout, fillContainerSize.w, GRID_GAP, orderedSessions.length)
+        : { min: 0.5, max: 1.3 };
+    // fillZoomBoundsVal is recomputed from live container/session state, so it
+    // shifts as the window resizes, the sidebar toggles, or sessions
+    // connect/disconnect. Without this, dragging the slider to its right edge
+    // (fillZoom = that render's max) would visibly fall short of the new
+    // right edge the next time bounds shrink the *other* direction — the
+    // thumb stays at the old absolute value while the track's max moves out
+    // from under it. Keep it pinned to whichever edge (or clamped into range)
+    // it was on last render instead of drifting.
+    useEffect(() => {
+        const prev = fillZoomBoundsPrev.current;
+        fillZoomBoundsPrev.current = fillZoomBoundsVal;
+        setFillZoom(z => {
+            if (z >= prev.max - 1e-6) return fillZoomBoundsVal.max;
+            if (z <= prev.min + 1e-6) return fillZoomBoundsVal.min;
+            return Math.min(fillZoomBoundsVal.max, Math.max(fillZoomBoundsVal.min, z));
+        });
+    }, [fillZoomBoundsVal.min, fillZoomBoundsVal.max]);
+
+    const renderSessionTile = (session: ActiveSession) => {
+        // Resolve name/IP from the live instance lists so a session restored
+        // on page load (before the lists have finished fetching) still shows
+        // the friendly name/IP instead of the raw instance id. Fall back to
+        // whatever was snapshotted at connect time.
+        const custom = customInstances.find(c => c.id === session.instanceId);
+        const ec2 = instances.find(i => i.id === session.instanceId);
+        const name = custom?.name || ec2?.label || ec2?.name || session.name;
+        const ip = custom?.ip || ec2?.publicIp || ec2?.privateIp || session.ip;
+        const os = custom?.os || ec2?.os || '';
+        const swapCtrlCmd = os === 'macos' && !!(custom?.swapKeys || ec2?.swapKeys);
+        const isDropTarget = dragOverId === session.instanceId && dragId !== session.instanceId;
+        const isMaximized = maximizedId === session.instanceId;
+        // Other panes stay mounted while one is maximized — just hidden —
+        // so their sessions don't drop and reconnect when restored.
+        const isHiddenByMaximize = maximizedId !== null && !isMaximized;
+        const toggleMaximize = () => {
+            // Capture scrollTop *before* the state update hides the other
+            // panes, not in a layout effect keyed on maximizedId — by the
+            // time that effect runs, React has already committed the
+            // hidden/absolute classes and the browser has already clamped
+            // scrollTop for the now-collapsed content, so reading it there
+            // would just see the already-clamped (usually 0) value.
+            if (maximizedId !== session.instanceId && contentScrollRef.current) {
+                savedMainScrollTop.current = contentScrollRef.current.scrollTop;
+            }
+            setMaximizedId(id => id === session.instanceId ? null : session.instanceId);
+        };
+        return (
+        <div
+            key={session.instanceId}
+            ref={(el) => { gridCellRefs.current[session.instanceId] = el; }}
+            onDragOver={(e) => { if (dragId) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; if (dragOverId !== session.instanceId) setDragOverId(session.instanceId); } }}
+            onDragLeave={() => { if (dragOverId === session.instanceId) setDragOverId(null); }}
+            onDrop={(e) => { e.preventDefault(); reorderSession(dragId, session.instanceId); setDragId(null); setDragOverId(null); }}
+            className={`flex items-center justify-center min-w-0 rounded-lg transition-[opacity,transform,box-shadow] duration-150 ease-out ${gridLayout === 4 ? 'overflow-hidden' : 'min-h-[240px]'} ${gridLayout === 3 ? 'min-w-full shrink-0 snap-center h-full' : ''} ${singleViewFit ? 'w-full shrink-0 h-full' : ''} ${isDropTarget ? 'ring-2 ring-blue-400 ring-offset-2 ring-offset-black scale-[1.015]' : ''} ${dragId === session.instanceId ? 'opacity-40 scale-[0.97]' : ''} ${isMaximized ? 'absolute inset-0 z-20 overflow-hidden' : ''} ${isHiddenByMaximize ? 'hidden' : ''}`}
+        >
+            {custom?.protocol === 'rustdesk' ? (
+                <RustDeskClient
+                    instanceId={session.instanceId}
+                    token={session.token}
+                    name={name}
+                    ip={ip}
+                    layoutVersion={resizeSignal}
+                    fitViewport={gridLayout !== 1 || singleViewFit}
+                    onToggleMaximize={toggleMaximize}
+                    os={os}
+                    swapCtrlCmd={swapCtrlCmd}
+                    clipboard={sharedClipboard}
+                    onClipboard={publishClipboard}
+                    onDisconnect={() => disconnectInstance(session.instanceId)}
+                    onRefresh={() => refreshInstance(session.instanceId)}
+                    onError={(message) => reportSessionError(session.instanceId, message)}
+                    onReorderDragStart={(e) => { setBlankDragImage(e); setDragId(session.instanceId); }}
+                    onReorderDragEnd={() => { setDragId(null); setDragOverId(null); }}
+                />
+            ) : (
+                <GuacamoleClient
+                    instanceId={session.instanceId}
+                    token={session.token}
+                    name={name}
+                    ip={ip}
+                    layoutVersion={resizeSignal}
+                    fitViewport={gridLayout !== 1 || singleViewFit}
+                    onToggleMaximize={toggleMaximize}
+                    protocol={custom?.protocol || 'rdp'}
+                    os={os}
+                    swapCtrlCmd={swapCtrlCmd}
+                    clipboard={sharedClipboard}
+                    onClipboard={publishClipboard}
+                    onDisconnect={() => disconnectInstance(session.instanceId)}
+                    onRefresh={() => refreshInstance(session.instanceId)}
+                    onError={(message) => reportSessionError(session.instanceId, message)}
+                    onReorderDragStart={(e) => { setBlankDragImage(e); setDragId(session.instanceId); }}
+                    onReorderDragEnd={() => { setDragId(null); setDragOverId(null); }}
+                    onFileTransfer={() => setFileTransferPanel({ fromInstanceId: session.instanceId })}
+                />
+            )}
+        </div>
+        );
+    };
 
     return (
-        <div className="min-h-screen bg-slate-950 text-slate-200 flex flex-col font-sans relative">
+        <div className="h-screen bg-slate-950 text-slate-200 flex flex-col font-sans relative overflow-hidden">
             {!isHeaderVisible && (
                 <button
                     onClick={() => setIsHeaderVisible(true)}
@@ -1267,15 +1921,8 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
 
             {/* Header */}
             {isHeaderVisible && (
-            <header className="relative bg-slate-900 border-b border-slate-800 p-4 flex justify-between items-center shadow-lg z-10">
+            <header className="relative bg-slate-900 border-b border-slate-800 p-4 flex justify-between items-center shadow-lg z-40">
                 <div className="flex items-center gap-4">
-                    <button
-                        onClick={() => setIsSidebarVisible(!isSidebarVisible)}
-                        className="text-slate-400 hover:text-white transition-colors p-1"
-                        title="Toggle Sidebar"
-                    >
-                        {isSidebarVisible ? <PanelLeftClose size={24} /> : <PanelLeftOpen size={24} />}
-                    </button>
                     <h1 className="text-2xl font-bold bg-gradient-to-r from-blue-400 to-indigo-500 bg-clip-text text-transparent">
                         RDm
                     </h1>
@@ -1297,33 +1944,48 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
 
                 <div className="flex items-center gap-2 bg-slate-800 p-1 rounded-lg border border-slate-700">
                     <button
-                        onClick={() => changeGridLayout(1)}
+                        onClick={() => toggleScrollPicker(1)}
                         className={`p-2 rounded transition-colors ${gridLayout === 1 ? 'bg-slate-700 text-blue-400' : 'text-slate-400 hover:text-white hover:bg-slate-700/50'}`}
                         title="Single View"
                     >
                         <Square size={20} />
                     </button>
                     <button
-                        onClick={() => changeGridLayout(3)}
+                        onClick={() => toggleScrollPicker(3)}
                         className={`p-2 rounded transition-colors ${gridLayout === 3 ? 'bg-slate-700 text-blue-400' : 'text-slate-400 hover:text-white hover:bg-slate-700/50'}`}
                         title="Horizontal Scroll"
                     >
                         <GalleryHorizontalEnd size={20} />
                     </button>
-                    <button
-                        onClick={() => changeGridLayout(2)}
-                        className={`p-2 rounded transition-colors ${gridLayout === 2 ? 'bg-slate-700 text-blue-400' : 'text-slate-400 hover:text-white hover:bg-slate-700/50'}`}
-                        title="2x2 Grid"
-                    >
-                        <Grid size={20} />
-                    </button>
-                    <button
-                        onClick={() => changeGridLayout(4)}
-                        className={`p-2 rounded transition-colors ${gridLayout === 4 ? 'bg-slate-700 text-blue-400' : 'text-slate-400 hover:text-white hover:bg-slate-700/50'}`}
-                        title="4x4 Grid"
-                    >
-                        <LayoutGrid size={20} />
-                    </button>
+                    <div className="relative">
+                        <button
+                            onClick={() => { changeGridLayout(4); setShowFillZoomSlider(true); }}
+                            className={`p-2 rounded transition-colors ${gridLayout === 4 ? 'bg-slate-700 text-blue-400' : 'text-slate-400 hover:text-white hover:bg-slate-700/50'}`}
+                            title="Grid"
+                        >
+                            <Grid size={20} />
+                        </button>
+                        {showFillZoomSlider && (
+                            <div
+                                onMouseLeave={() => setShowFillZoomSlider(false)}
+                                className="absolute top-full mt-2 left-1/2 -translate-x-1/2 bg-slate-800 border border-slate-700 rounded-lg shadow-xl px-3 py-2 z-50 flex items-center"
+                            >
+                                <input
+                                    type="range"
+                                    min={fillZoomBoundsVal.min}
+                                    max={fillZoomBoundsVal.max}
+                                    // A fixed step snaps to a grid measured from `min`, which almost
+                                    // never lands exactly on `max` once bounds are computed dynamically
+                                    // (non-round numbers) — dragging/keying to the end would visibly stop
+                                    // short of the right edge. `any` lets it reach the exact min/max.
+                                    step="any"
+                                    value={fillZoom}
+                                    onChange={(e) => setFillZoom(Number(e.target.value))}
+                                    className="w-32 accent-blue-500"
+                                />
+                            </div>
+                        )}
+                    </div>
                     <div className="w-px h-6 bg-slate-700 mx-1"></div>
                     <button
                         onClick={() => setReorderMode(true)}
@@ -1348,7 +2010,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                     over the header content. */}
                 <button
                     onClick={() => setIsHeaderVisible(false)}
-                    className="absolute top-full left-1/2 -translate-x-1/2 bg-slate-800 text-slate-400 hover:text-white px-6 h-5 rounded-b-lg border-b border-x border-slate-700 shadow-md z-20 opacity-40 hover:opacity-100 transition-opacity flex items-center justify-center"
+                    className="absolute top-full left-1/2 -translate-x-1/2 bg-slate-800 text-slate-400 hover:text-white px-6 h-5 rounded-b-lg border-b border-x border-slate-700 shadow-md z-40 opacity-40 hover:opacity-100 transition-opacity flex items-center justify-center"
                     title="Hide Header"
                 >
                     <ChevronUp size={16} />
@@ -1356,7 +2018,19 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
             </header>
             )}
 
-            <div className="flex flex-1 overflow-hidden">
+            <div className="flex flex-1 overflow-hidden relative">
+                {/* Sidebar hider: mirrors the header's show/hide tabs, but centered
+                    on the left edge and fully invisible until hovered. */}
+                {!isSidebarVisible && (
+                    <button
+                        onClick={() => setSidebarPref(true)}
+                        className="fixed top-1/2 left-0 -translate-y-1/2 bg-slate-800 text-slate-400 hover:text-white py-6 px-1 rounded-r-lg border-r border-y border-slate-700 shadow-xl z-30 opacity-20 hover:opacity-100 hover:z-50 transition-all flex items-center justify-center"
+                        title="Show Sidebar"
+                    >
+                        <PanelLeftOpen size={20} />
+                    </button>
+                )}
+
                 {/* Sidebar */}
                 {isSidebarVisible && (
                     <aside className="w-64 bg-slate-900 border-r border-slate-800 flex flex-col overflow-y-auto shrink-0">
@@ -1516,57 +2190,91 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                 </aside>
                 )}
 
+                {isSidebarVisible && (
+                    <button
+                        onClick={() => setSidebarPref(false)}
+                        className="fixed top-1/2 left-64 -translate-y-1/2 bg-slate-800 text-slate-400 hover:text-white w-5 py-6 rounded-r-lg border-r border-y border-slate-700 shadow-md z-20 opacity-40 hover:opacity-100 hover:z-50 transition-opacity flex items-center justify-center"
+                        title="Hide Sidebar"
+                    >
+                        <PanelLeftClose size={20} />
+                    </button>
+                )}
+
                 {/* Main Content - Grid View */}
-                <main className="flex-1 bg-black p-4 overflow-y-auto">
-                    {orderedSessions.length === 0 ? (
-                        <div className="h-full flex flex-col items-center justify-center text-slate-500">
-                            <Maximize size={48} className="mb-4 opacity-20" />
-                            <p className="text-lg">Select an instance to start a session</p>
-                        </div>
-                    ) : (
-                        <div className={`gap-4 h-full ${getGridClass()}`}>
-                            {orderedSessions.map(session => {
-                                // Resolve name/IP from the live instance lists so a
-                                // session restored on page load (before the lists have
-                                // finished fetching) still shows the friendly name/IP
-                                // instead of the raw instance id. Fall back to whatever
-                                // was snapshotted at connect time.
-                                const custom = customInstances.find(c => c.id === session.instanceId);
-                                const ec2 = instances.find(i => i.id === session.instanceId);
-                                const name = custom?.name || ec2?.label || ec2?.name || session.name;
-                                const ip = custom?.ip || ec2?.publicIp || ec2?.privateIp || session.ip;
-                                const os = custom?.os || ec2?.os || '';
-                                const swapCtrlCmd = os === 'macos' && !!(custom?.swapKeys || ec2?.swapKeys);
-                                const isDropTarget = dragOverId === session.instanceId && dragId !== session.instanceId;
-                                return (
+                <main
+                    ref={mainRef}
+                    className={`flex-1 min-w-0 min-h-0 overflow-hidden bg-black flex ${pickerActive ? (gridLayout === 3 ? 'flex-row' : 'flex-col') : ''}`}
+                >
+                    <div ref={contentScrollRef} className="relative flex-1 min-w-0 min-h-0 overflow-y-auto p-3 [scrollbar-gutter:stable]">
+                        {orderedSessions.length === 0 ? (
+                            <div className="h-full flex flex-col items-center justify-center text-slate-500">
+                                <Maximize size={48} className="mb-4 opacity-20" />
+                                <p className="text-lg">Select an instance to start a session</p>
+                            </div>
+                        ) : (
+                            // Both branches below render the exact same wrapper shape
+                            // (this div and its one child) regardless of gridLayout,
+                            // varying only className/style — switching in or out of
+                            // Fill (gridLayout 4) used to swap between structurally
+                            // different JSX branches here, which made React unmount
+                            // and remount every session pane underneath (a fresh
+                            // Guacamole/RustDesk connection each time, hence a black
+                            // pane until it reconnected). Keeping one stable shape
+                            // lets React just update attributes on the existing DOM
+                            // and preserve the live session components across layout
+                            // switches.
+                            //
+                            // Fill (gridLayout 4): tiles are sized/packed dynamically
+                            // (computeFillLayout) to fit as many 16:9 cards on screen
+                            // as possible, with rows packed to their actual content
+                            // height instead of stretched fr rows — otherwise a
+                            // couple of tall rows end up far apart.
+                            <div
+                                ref={setFillGridRef}
+                                className={gridLayout === 4 ? 'relative h-full w-full flex overflow-visible' : 'relative h-full w-full'}
+                                style={gridLayout === 4 ? { justifyContent: 'center', alignItems: fillLayout?.fitsVertically ? 'center' : 'flex-start' } : undefined}
+                            >
                                 <div
-                                    key={session.instanceId}
-                                    ref={(el) => { gridCellRefs.current[session.instanceId] = el; }}
-                                    onDragOver={(e) => { if (dragId) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; if (dragOverId !== session.instanceId) setDragOverId(session.instanceId); } }}
-                                    onDragLeave={() => { if (dragOverId === session.instanceId) setDragOverId(null); }}
-                                    onDrop={(e) => { e.preventDefault(); reorderSession(dragId, session.instanceId); setDragId(null); setDragOverId(null); }}
-                                    className={`flex items-center justify-center min-h-[240px] min-w-0 rounded-lg transition-[opacity,transform,box-shadow] duration-150 ease-out ${gridLayout === 3 ? 'min-w-full shrink-0 snap-center h-full' : ''} ${isDropTarget ? 'ring-2 ring-blue-400 ring-offset-2 ring-offset-black scale-[1.015]' : ''} ${dragId === session.instanceId ? 'opacity-40 scale-[0.97]' : ''}`}
+                                    // Single view (1) deliberately omits h-full: an
+                                    // `auto`-tracked CSS grid inside a *height-bound*
+                                    // container proportionally shrinks its rows to
+                                    // fit when their natural content size is more
+                                    // than the container's fixed height — which
+                                    // squeezed single-view cards exactly like
+                                    // auto-rows-fr did, just via grid's own sizing
+                                    // algorithm instead. Letting the grid itself grow
+                                    // past the viewport (this div's own overflow-y-auto
+                                    // handles the rest) is what lets rows sit at their
+                                    // natural full size.
+                                    className={gridLayout === 4 ? 'grid' : `gap-1 ${gridLayout === 1 && !singleViewFit ? '' : 'h-full'} ${getGridClass()}`}
+                                    style={gridLayout === 4 && fillLayout ? {
+                                        gridTemplateColumns: `repeat(${fillLayout.cols}, ${fillLayout.tileW}px)`,
+                                        gridAutoRows: `${fillLayout.tileH}px`,
+                                        gap: `${GRID_GAP}px`,
+                                    } : undefined}
                                 >
-                                    <GuacamoleClient
-                                        instanceId={session.instanceId}
-                                        token={session.token}
-                                        name={name}
-                                        ip={ip}
-                                        protocol={custom?.protocol || 'rdp'}
-                                        os={os}
-                                        swapCtrlCmd={swapCtrlCmd}
-                                        clipboard={sharedClipboard}
-                                        onClipboard={publishClipboard}
-                                        onDisconnect={() => disconnectInstance(session.instanceId)}
-                                        onRefresh={() => refreshInstance(session.instanceId)}
-                                        onError={(message) => reportSessionError(session.instanceId, message)}
-                                        onReorderDragStart={(e) => { setBlankDragImage(e); setDragId(session.instanceId); }}
-                                        onReorderDragEnd={() => { setDragId(null); setDragOverId(null); }}
-                                        onFileTransfer={() => setFileTransferPanel({ fromInstanceId: session.instanceId })}
-                                    />
+                                    {orderedSessions.map(renderSessionTile)}
                                 </div>
-                                );
-                            })}
+                            </div>
+                        )}
+                    </div>
+                    {pickerActive && (
+                        // Docked as a flex sibling of the scrollable session area
+                        // above (not an overlay on top of it), so the session area
+                        // shrinks to make room instead of the strip ever covering a
+                        // pane. Centers the strip along its own axis, which is what
+                        // gives the "grows outward from the center" placement as
+                        // more sessions connect.
+                        <div
+                            className={`relative shrink-0 overflow-hidden flex items-center justify-center bg-slate-950/40 ${gridLayout === 3 ? 'flex-col border-l border-slate-800 px-3' : 'flex-row border-t border-slate-800 py-3'}`}
+                        >
+                            <SessionPicker
+                                sessions={pickerSessions}
+                                orientation={gridLayout === 3 ? 'right' : 'bottom'}
+                                itemHeight={pickerItemH}
+                                onJump={jumpToSession}
+                                getSourceEl={getSessionSourceEl}
+                            />
                         </div>
                     )}
                 </main>
@@ -1614,14 +2322,26 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                     <select
                                         className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500"
                                         value={instanceForm.protocol}
-                                        onChange={e => setInstanceForm({...instanceForm, protocol: e.target.value as 'rdp' | 'vnc'})}
+                                        onChange={e => {
+                                            const protocol = e.target.value as Protocol;
+                                            // Each protocol has its own saved username/password — show that
+                                            // protocol's own state instead of carrying over the previous one's.
+                                            const creds = instanceForm.savedCreds[protocol];
+                                            setInstanceForm({...instanceForm, protocol, username: creds.username, hasPassword: creds.hasPassword, password: '', changePassword: false});
+                                        }}
                                     >
                                         <option value="rdp">RDP (port 3389)</option>
                                         <option value="vnc">VNC (port 5900)</option>
+                                        <option value="rustdesk">RustDesk (port 21118)</option>
                                     </select>
                                     {instanceForm.protocol === 'vnc' && (
                                         <p className="text-xs text-slate-500 mt-1">
                                             Most VNC servers (e.g. UltraVNC) refuse all connections with a blank password — set one below even if the server's real auth is MS-Logon.
+                                        </p>
+                                    )}
+                                    {instanceForm.protocol === 'rustdesk' && (
+                                        <p className="text-xs text-slate-500 mt-1">
+                                            On the target machine: RustDesk → Settings → Network → unlock and enable "Direct IP Access", and Settings → Security → set a permanent password (that password goes below). Only works when rdm can reach that IP directly — no relay/rendezvous server involved.
                                         </p>
                                     )}
                                 </div>
@@ -1665,10 +2385,12 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                     </p>
                                 </div>
                             )}
-                            <div>
-                                <label className="block text-xs text-slate-400 mb-1">Username</label>
-                                <input required type="text" className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500" value={instanceForm.username} onChange={e => setInstanceForm({...instanceForm, username: e.target.value})} />
-                            </div>
+                            {instanceForm.protocol !== 'rustdesk' && (
+                                <div>
+                                    <label className="block text-xs text-slate-400 mb-1">Username</label>
+                                    <input required type="text" className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500" value={instanceForm.username} onChange={e => setInstanceForm({...instanceForm, username: e.target.value})} />
+                                </div>
+                            )}
                             <div>
                                 {isAdd ? (
                                     <>
@@ -2093,7 +2815,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                 <input type="checkbox" checked={globalSettings.fontSmoothing} onChange={e => {
                                     const newSet = {...globalSettings, fontSmoothing: e.target.checked};
                                     setGlobalSettings(newSet);
-                                    localStorage.setItem('rdpm_settings', JSON.stringify(newSet));
+                                    localStorage.setItem('rdm_settings', JSON.stringify(newSet));
                                 }} className="w-4 h-4" />
                             </div>
                             <div>
@@ -2104,7 +2826,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                     onChange={e => {
                                         const newSet = {...globalSettings, colorDepth: e.target.value};
                                         setGlobalSettings(newSet);
-                                        localStorage.setItem('rdpm_settings', JSON.stringify(newSet));
+                                        localStorage.setItem('rdm_settings', JSON.stringify(newSet));
                                     }}
                                 >
                                     <option value="16">16-bit (Faster)</option>
@@ -2120,7 +2842,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                 <input type="checkbox" checked={globalSettings.vncLossless} onChange={e => {
                                     const newSet = {...globalSettings, vncLossless: e.target.checked};
                                     setGlobalSettings(newSet);
-                                    localStorage.setItem('rdpm_settings', JSON.stringify(newSet));
+                                    localStorage.setItem('rdm_settings', JSON.stringify(newSet));
                                 }} className="w-4 h-4" />
                             </div>
 

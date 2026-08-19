@@ -18,3 +18,5 @@ key.pem
 # Local database (contains encrypted credentials)
 *.sqlite
 *.sqlite3
+
+settings.json

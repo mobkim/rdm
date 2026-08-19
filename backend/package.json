@@ -21,6 +21,7 @@
     "express": "^5.2.1",
     "get-port": "^7.2.0",
     "guacamole-lite": "^1.2.0",
+    "protobufjs": "^8.7.2",
     "qrcode": "^1.5.4",
     "sqlite": "^5.1.1",
     "sqlite3": "^6.0.1",

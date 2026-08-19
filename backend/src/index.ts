@@ -14,7 +14,9 @@ import { EC2Client, DescribeInstancesCommand, StartInstancesCommand, StopInstanc
 import { CostExplorerClient, GetCostAndUsageCommand } from '@aws-sdk/client-cost-explorer';
 import { PricingClient, GetProductsCommand } from '@aws-sdk/client-pricing';
 import GuacamoleLite from 'guacamole-lite';
+import { WebSocketServer } from 'ws';
 import { startSSMTunnel } from './ssmTunnel';
+import { createRustDeskSession, attachRustDeskSession } from './rustdesk/sessionManager';
 import { getWindowsPassword } from './passwordDecrypt';
 import { initDb, addCustomInstance, updateCustomInstance, getCustomInstances, deleteCustomInstance, getCustomInstance, getAllEc2Settings, getEc2SettingFull, upsertEc2Setting } from './db';
 import { authRouter, requireAuth } from './auth';
@@ -22,6 +24,22 @@ import { authRouter, requireAuth } from './auth';
 import Crypt from 'guacamole-lite/lib/Crypt';
 
 dotenv.config();
+
+// guacamole-lite's ClientConnection constructor catches a bad/missing token,
+// tries to close gracefully — but Server.js calls .connect() on it right
+// after regardless, unconditionally, which throws on the now-unset
+// this.connectionSettings.connection inside an async event handler. That's
+// an unhandled rejection, and Node's default behavior for those is to crash
+// the whole process — every other live session (RDP/VNC included) with it,
+// over a single stray or expired-token WebSocket request. Not something to
+// patch in node_modules (wiped on install); contain it here instead so one
+// bad request can't take the server down.
+process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled rejection (kept process alive):', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught exception (kept process alive):', err);
+});
 
 const app = express();
 
@@ -308,14 +326,58 @@ app.post('/api/guacd/:action', async (req, res) => {
     res.json({ ...guacdStatus(probe), action });
 });
 
-// Constructing GuacamoleLite attaches the WebSocket handler to `server`; we
-// don't need the returned instance (tokens are encrypted directly below).
-new GuacamoleLite(
+// Passing `{ server }` makes both GuacamoleLite and a plain WebSocketServer
+// register their own independent 'upgrade' listener directly on `server`.
+// Node calls every listener for an event, not just the first match — so with
+// two of them, a request either gets its handshake completed twice (ws's own
+// completeUpgrade() throws — "was called more than once with the same
+// socket, possibly due to a misconfiguration") or, when a `path` filter is
+// added to route around that, a request whose path doesn't hit either filter
+// (e.g. a reverse proxy passing through the unstripped '/rdm/ws' rather than
+// '/ws') matches neither and gets no response at all — both failure modes
+// this app hit as regressions from that setup: gem12's guac tunnel getting a
+// corrupted stream ("Invalid frame header"), and RustDesk's WS never
+// completing. Instead: exactly one dispatcher owns the 'upgrade' event and
+// picks exactly one handler, matched by suffix so it's robust to whatever
+// prefix a reverse proxy does or doesn't strip.
+const guacServer = new GuacamoleLite(
     { server },
     guacClientOptions,
     guacOptions,
     {}
 );
+const rustdeskWss = new WebSocketServer({ noServer: true });
+rustdeskWss.on('connection', (ws, req) => {
+    const sessionId = new URL(req.url || '', 'http://localhost').searchParams.get('session');
+    if (!sessionId) {
+        ws.close(4400, 'missing session id');
+        return;
+    }
+    attachRustDeskSession(sessionId, ws).catch((err) => {
+        console.error('Error attaching rustdesk session:', err);
+        ws.close(1011, 'internal error');
+    });
+});
+
+server.removeAllListeners('upgrade');
+server.on('upgrade', (req, socket, head) => {
+    const pathname = new URL(req.url || '', 'http://localhost').pathname;
+    const target = pathname.endsWith('/rustdesk-ws') ? rustdeskWss : (guacServer as any).webSocketServer;
+    target.handleUpgrade(req, socket, head, (ws: any) => target.emit('connection', ws, req));
+});
+
+// guacamole-lite installs its own SIGTERM/SIGINT handler that closes its own
+// sockets — it doesn't know about rustdeskWss. Without this, a RustDesk
+// session (or even just one mid-connect) left an open, un-unref'd socket that
+// held the event loop past systemd's stop timeout, forcing a SIGKILL of the
+// whole process — taking every other live session down with it, RDP/VNC
+// included, instead of exiting cleanly.
+const shutdownRustdesk = () => {
+    rustdeskWss.clients.forEach((ws) => ws.terminate());
+    rustdeskWss.close();
+};
+process.on('SIGTERM', shutdownRustdesk);
+process.on('SIGINT', shutdownRustdesk);
 
 app.get('/api/custom-instances', async (req, res) => {
     try {
@@ -329,7 +391,7 @@ app.get('/api/custom-instances', async (req, res) => {
 app.post('/api/custom-instances', async (req, res) => {
     try {
         const { id, name, ip, username, password, protocol, os, swapKeys } = req.body;
-        await addCustomInstance(id, name, ip, username, password, protocol || 'rdp', os || '', !!swapKeys);
+        await addCustomInstance(id, name, ip, protocol || 'rdp', username, password, os || '', !!swapKeys);
         res.json({ success: true });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
@@ -369,6 +431,27 @@ app.put('/api/ec2-settings/:id', async (req, res) => {
 
 app.post('/api/connect', async (req, res) => {
     try {
+        const { instanceId, customId, settings = {} } = req.body;
+
+        // RustDesk doesn't go through guacd/guacamole-lite at all, so its
+        // custom instance's protocol has to be resolved before the guacd
+        // probe below (which only applies to the Guacamole RDP/VNC path)
+        // rather than after it — otherwise a stopped guacd would wrongly
+        // block a RustDesk connection that never needed it.
+        let custom: any = null;
+        if (customId) {
+            custom = await getCustomInstance(customId);
+            if (!custom) {
+                return res.status(404).json({ error: 'Custom instance not found' });
+            }
+            if (custom.protocol === 'rustdesk') {
+                const sessionId = createRustDeskSession({ host: custom.ip, password: custom.password || '' });
+                return res.json({ sessionId, instanceId: customId, protocol: 'rustdesk' });
+            }
+        } else if (!instanceId) {
+            return res.status(400).json({ error: 'Missing instanceId or customId' });
+        }
+
         // Checked before any of the work below, so a stopped guacd is reported as
         // itself instead of as a session that opens and instantly vanishes.
         const probe = await probeGuacd();
@@ -376,21 +459,16 @@ app.post('/api/connect', async (req, res) => {
             return res.status(503).json({ error: guacdUnreachableMessage(probe.error) });
         }
 
-        const { instanceId, customId, settings = {} } = req.body;
-
         let rdpHostname = '';
         let rdpPort = 3389;
         let dynamicPassword = '';
         let username = process.env.AWS_RDP_USERNAME || 'Administrator';
         // EC2 instances are always RDP (Windows Server, password via
-        // GetPasswordData) — only a custom instance can be VNC.
+        // GetPasswordData) — only a custom instance can be VNC (or RustDesk,
+        // handled above).
         let protocol = 'rdp';
 
-        if (customId) {
-            const custom = await getCustomInstance(customId);
-            if (!custom) {
-                return res.status(404).json({ error: 'Custom instance not found' });
-            }
+        if (custom) {
             rdpHostname = custom.ip;
             dynamicPassword = custom.password || '';
             username = custom.username || 'Administrator';
@@ -430,10 +508,9 @@ app.post('/api/connect', async (req, res) => {
                 const fetchedPassword = await getWindowsPassword(ec2, instanceId);
                 dynamicPassword = fetchedPassword || process.env.RDP_PASSWORD || '';
             }
-        } else {
-            return res.status(400).json({ error: 'Missing instanceId or customId' });
         }
-        
+        // (neither custom nor instanceId: already returned 400 above)
+
         // Prepare Guacamole connection settings for this tunnel. RDP and VNC
         // take different parameter sets — VNC has no NLA/theming/composition
         // concept, and the server (not the client) dictates its own
@@ -487,6 +564,14 @@ app.post('/api/connect', async (req, res) => {
                     'ignore-cert': 'true',
                     width: '1920',
                     height: '1080',
+                    // Otherwise guacd is free to renegotiate the session
+                    // resolution to match whatever pixel size the grid pane
+                    // currently renders at (e.g. while the fill grid
+                    // reflows), which briefly blacks out the RDP session
+                    // mid-resize. Pin it to the fixed 1920x1080 above and
+                    // let the client-side canvas scaling in
+                    // GuacamoleClient handle fitting it into the pane.
+                    'resize-method': 'none',
                     'color-depth': settings.colorDepth || '32',
                     'enable-font-smoothing': settings.fontSmoothing !== false ? 'true' : 'false',
                     'enable-theming': 'true',
