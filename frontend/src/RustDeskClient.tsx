@@ -93,6 +93,15 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
     const cursorCache = useRef<Map<number, { url: string; hotx: number; hoty: number; width: number; height: number }>>(new Map());
     const currentCursorId = useRef<number>(0);
     const cursorPos = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+    // The remote's actual pixel resolution, from PeerInfo — the authoritative source for
+    // scaling clicks/moves back to remote coordinates. `el.naturalWidth`/`naturalHeight`
+    // (what this used to read) reflects whatever JPEG frame the img last decoded, which is
+    // one more asynchronous step removed from "what the remote screen size actually is";
+    // relying on it (with a hardcoded 1920x1080 fallback) meant any transient mismatch sent
+    // a real absolute mouse_move_to at the wrong scale — the Mac's cursor visibly jumping
+    // to a wrong spot for one event, since move (unlike down/up/wheel) is the one mouse
+    // event type the remote actually repositions the OS cursor for.
+    const displaySize = useRef<{ w: number; h: number }>({ w: 1920, h: 1080 });
     const [status, setStatus] = useState<string>('Connecting...');
     const wsRef = useRef<WebSocket | null>(null);
     const lastClipboard = useRef<string>('');
@@ -179,9 +188,9 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
                 return;
             }
             const rect = el.getBoundingClientRect();
-            if (!rect.width || !rect.height || !el.naturalWidth || !el.naturalHeight) return;
-            const scaleX = rect.width / el.naturalWidth;
-            const scaleY = rect.height / el.naturalHeight;
+            if (!rect.width || !rect.height) return;
+            const scaleX = rect.width / displaySize.current.w;
+            const scaleY = rect.height / displaySize.current.h;
             const { x, y } = cursorPos.current;
             cursorEl.style.display = 'block';
             cursorEl.style.width = `${cursor.width * scaleX}px`;
@@ -218,6 +227,7 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
                     // the *real* remote position until the first actual move.
                     const display = msg.peerInfo?.displays?.[0];
                     if (display?.width && display?.height) {
+                        displaySize.current = { w: display.width, h: display.height };
                         cursorPos.current = { x: Math.round(display.width / 2), y: Math.round(display.height / 2) };
                         positionCursor();
                     }
@@ -274,14 +284,18 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
             if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
         };
 
-        // Mouse: coordinates scaled from the displayed <img> box back to the
-        // remote's native pixels (the img is drawn at `box`, the remote is 1920x1080).
-        const scaleCoords = (e: React.MouseEvent | MouseEvent): { x: number; y: number } => {
+        // Mouse: coordinates scaled from the displayed <img> box back to the remote's
+        // native pixels (displaySize, from PeerInfo — see the ref's own comment for why
+        // not el.naturalWidth). Returns null rather than a guessed {x:0, y:0} when the
+        // element isn't laid out yet — callers must skip sending on null, since {0,0}
+        // would be a real absolute move command to the screen's top-left corner.
+        const scaleCoords = (e: React.MouseEvent | MouseEvent): { x: number; y: number } | null => {
             const el = imgRef.current;
-            if (!el) return { x: 0, y: 0 };
+            if (!el) return null;
             const rect = el.getBoundingClientRect();
-            const scaleX = (el.naturalWidth || 1920) / rect.width;
-            const scaleY = (el.naturalHeight || 1080) / rect.height;
+            if (!rect.width || !rect.height) return null;
+            const scaleX = displaySize.current.w / rect.width;
+            const scaleY = displaySize.current.h / rect.height;
             return { x: Math.round((e.clientX - rect.left) * scaleX), y: Math.round((e.clientY - rect.top) * scaleY) };
         };
         const buttonBit = (button: number) => (button === 2 ? MOUSE_BUTTON_RIGHT : button === 1 ? MOUSE_BUTTON_MIDDLE : MOUSE_BUTTON_LEFT);
@@ -292,20 +306,26 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
         // we'd never receive a single cursor-pos message this way — so track position
         // locally from our own input instead, same as RustDesk's own client does.
         const onMouseMove = (e: MouseEvent) => {
-            const { x, y } = scaleCoords(e);
+            const coords = scaleCoords(e);
+            if (!coords) return;
+            const { x, y } = coords;
             cursorPos.current = { x, y };
             positionCursor();
             send({ type: 'mouse', mask: MOUSE_TYPE_MOVE, x, y, modifiers: modifiersArray() });
         };
         const onMouseDown = (e: MouseEvent) => {
             e.preventDefault();
-            const { x, y } = scaleCoords(e);
+            const coords = scaleCoords(e);
+            if (!coords) return;
+            const { x, y } = coords;
             cursorPos.current = { x, y };
             positionCursor();
             send({ type: 'mouse', mask: MOUSE_TYPE_DOWN | (buttonBit(e.button) << 3), x, y, modifiers: modifiersArray() });
         };
         const onMouseUp = (e: MouseEvent) => {
-            const { x, y } = scaleCoords(e);
+            const coords = scaleCoords(e);
+            if (!coords) return;
+            const { x, y } = coords;
             cursorPos.current = { x, y };
             positionCursor();
             send({ type: 'mouse', mask: MOUSE_TYPE_UP | (buttonBit(e.button) << 3), x, y, modifiers: modifiersArray() });
