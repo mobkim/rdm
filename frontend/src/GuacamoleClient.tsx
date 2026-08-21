@@ -367,7 +367,7 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, layoutVersio
         // need a lower threshold to feel the same; tuned by feel per-OS.
         // VNC-only; RDP is untouched.
         // @ts-ignore — missing from the (outdated) type defs, but present at runtime
-        if (protocol === 'vnc') mouse.scrollThreshold = os === 'macos' ? 6 : 18;
+        if (protocol === 'vnc') mouse.scrollThreshold = os === 'macos' ? 6 : 30;
         // @ts-ignore
         mouse.onmousedown = mouse.onmouseup = mouse.onmousemove = (mouseState: any) => {
             const scale = display.getScale() || 1;
