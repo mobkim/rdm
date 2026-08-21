@@ -104,9 +104,22 @@ export async function attachRustDeskSession(id: string, ws: WebSocket): Promise<
     }
   });
 
-  client.on('clipboard', (c: { content?: Uint8Array; format?: number }) => {
+  client.on('clipboard', (c: { content?: Uint8Array; format?: number; compress?: boolean }) => {
     if (c.format !== 0 /* ClipboardFormat.Text */ || !c.content) return;
-    sendJson(ws, { type: 'clipboard', text: Buffer.from(c.content).toString('utf8') });
+    // Same as CursorData.colors below: the peer zstd-compresses clipboard content once
+    // it's past some size threshold (clipboard.rs), signaled by Clipboard.compress. A
+    // short copy arrives uncompressed; a longer one arrives as zstd bytes, which a plain
+    // utf8 decode turns into mojibake since it's decoding compressed bytes as if they
+    // were the text itself.
+    let text: string;
+    try {
+      const raw = c.compress ? zlib.zstdDecompressSync(Buffer.from(c.content)) : Buffer.from(c.content);
+      text = raw.toString('utf8');
+    } catch (err) {
+      console.error('[rustdesk] failed to zstd-decompress clipboard:', err);
+      return;
+    }
+    sendJson(ws, { type: 'clipboard', text });
   });
 
   client.on('cursor-data', (c: { id?: unknown; hotx?: number; hoty?: number; width?: number; height?: number; colors?: Uint8Array }) => {
