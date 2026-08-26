@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useLayoutEffect } from 'react';
-import { Grid, Maximize, Square, PlayCircle, StopCircle, RefreshCw, PanelLeftClose, PanelLeftOpen, Plus, X, ChevronUp, ChevronDown, Settings, GalleryHorizontalEnd, Loader2, DollarSign, AlertTriangle, ArrowUpDown, GripVertical, Check, Cpu, LogOut, ShieldCheck, ShieldOff } from 'lucide-react';
+import { Grid, Maximize, Square, PlayCircle, StopCircle, RefreshCw, PanelLeftClose, PanelLeftOpen, Plus, X, ChevronUp, ChevronDown, Settings, SlidersHorizontal, GalleryHorizontalEnd, Loader2, DollarSign, AlertTriangle, ArrowUpDown, GripVertical, Check, Cpu, LogOut, ShieldCheck, ShieldOff } from 'lucide-react';
 import { GuacamoleClient } from './GuacamoleClient';
 import { RustDeskClient } from './RustDeskClient';
 import { useDeviceClipboard } from './deviceClipboard';
@@ -906,13 +906,30 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         savedCreds: emptyCreds()
     });
 
+    // Mass-edit modal: apply the same instance type / OS / username / password
+    // change to many EC2 instances at once. `os: '__nochange__'` is a sentinel
+    // distinct from '' (which explicitly clears the OS override) — both this
+    // and a blank instanceType/username, and an unchecked changePassword, mean
+    // "leave that field alone" for every selected instance.
+    const [massEditModal, setMassEditModal] = useState(false);
+    const [massEditBusy, setMassEditBusy] = useState(false);
+    const [massEditForm, setMassEditForm] = useState({
+        selected: {} as Record<string, boolean>,
+        instanceType: '',
+        os: '__nochange__' as '__nochange__' | '' | 'windows' | 'macos' | 'linux',
+        swapKeys: false,
+        username: '',
+        changePassword: false,
+        password: ''
+    });
+
     // Reusable confirmation dialog (used for every stop action).
     const [confirm, setConfirm] = useState<ConfirmState | null>(null);
 
     // Instance-type picker, opened from the EC2 settings modal. The catalogue is
     // ~hundreds of entries per architecture and never changes, so it's fetched
     // once per architecture and kept for the session.
-    const [typeModal, setTypeModal] = useState<{ instanceId: string } | null>(null);
+    const [typeModal, setTypeModal] = useState<{ mode: 'single'; instanceId: string } | { mode: 'mass' } | null>(null);
     const [instanceTypes, setInstanceTypes] = useState<InstanceTypeSpec[] | null>(null);
     const [pricingMeta, setPricingMeta] = useState<PricingMeta | null>(null);
     const [typesError, setTypesError] = useState('');
@@ -1452,17 +1469,12 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         return () => { cancelled = true; };
     }, [catalogueSignature, loadInstanceTypes]);
 
-    // Open the instance-type picker for an EC2 instance.
-    const openTypeModal = async (inst: EC2Instance) => {
-        setTypeModal({ instanceId: inst.id });
-        setTypeSelection(inst.instanceType || '');
-        setTypeSearch('');
-        // Filters from a previous instance would otherwise carry over and hide
-        // everything for a machine whose catalogue doesn't have those values.
-        setTypeFilters({ vcpus: '', memoryMib: '', network: '' });
-        setTypesError('');
-
-        const key = catalogueKeyFor(inst);
+    // Loads (or serves cached) the instance-type catalogue for whichever
+    // instance the open picker is keyed off of — the actual instance being
+    // resized in single mode, or a representative selected instance in mass
+    // mode (see openMassTypeModal).
+    const loadTypesFor = async (ref: EC2Instance) => {
+        const key = catalogueKeyFor(ref);
         typeRequest.current = key;
 
         // Already warmed — show it without a loading pass.
@@ -1486,6 +1498,35 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
             if (typeRequest.current !== key) return;
             setTypesError(err.message || 'Failed to load instance types');
         }
+    };
+
+    // Open the instance-type picker for a single EC2 instance.
+    const openTypeModal = async (inst: EC2Instance) => {
+        setTypeModal({ mode: 'single', instanceId: inst.id });
+        setTypeSelection(inst.instanceType || '');
+        setTypeSearch('');
+        // Filters from a previous instance would otherwise carry over and hide
+        // everything for a machine whose catalogue doesn't have those values.
+        setTypeFilters({ vcpus: '', memoryMib: '', network: '' });
+        setTypesError('');
+        await loadTypesFor(inst);
+    };
+
+    // Open the same picker from the mass-edit modal. There's no single
+    // instance to resize here — the catalogue/pricing shown is sourced from
+    // one representative selected instance, and picking a row just stages
+    // that type string into massEditForm.instanceType (applied to every
+    // selected instance, independently, when the mass edit is submitted).
+    const openMassTypeModal = async () => {
+        const ids = Object.keys(massEditForm.selected).filter(id => massEditForm.selected[id]);
+        const ref = instances.find(i => ids.includes(i.id));
+        if (!ref) return;
+        setTypeModal({ mode: 'mass' });
+        setTypeSelection(massEditForm.instanceType || ref.instanceType || '');
+        setTypeSearch('');
+        setTypeFilters({ vcpus: '', memoryMib: '', network: '' });
+        setTypesError('');
+        await loadTypesFor(ref);
     };
 
     // Clicking a column header sorts by it; clicking the active one reverses.
@@ -1570,6 +1611,91 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         } catch (err) {
             pushToast('Failed to save instance settings', 'error');
         }
+    };
+
+    const openMassEdit = () => {
+        setMassEditForm({
+            selected: Object.fromEntries(instances.map(i => [i.id, true])),
+            instanceType: '',
+            os: '__nochange__',
+            swapKeys: false,
+            username: '',
+            changePassword: false,
+            password: ''
+        });
+        setMassEditModal(true);
+    };
+
+    // Applies whichever fields were actually touched to every selected
+    // instance. Instance type is a live AWS resize (its own endpoint,
+    // per-instance results); username/OS/password are local DB overrides
+    // (one bulk upsert). Omitting an untouched field from the request bodies
+    // is what makes upsertEc2Setting leave it alone — see its `??` fallbacks.
+    const applyMassEdit = async () => {
+        const ids = Object.keys(massEditForm.selected).filter(id => massEditForm.selected[id]);
+        if (!ids.length) return;
+
+        const settingsFields: { username?: string; os?: string; swapKeys?: boolean; changePassword?: boolean; password?: string } = {};
+        if (massEditForm.username.trim()) settingsFields.username = massEditForm.username.trim();
+        if (massEditForm.os !== '__nochange__') {
+            settingsFields.os = massEditForm.os;
+            if (massEditForm.os === 'macos') settingsFields.swapKeys = massEditForm.swapKeys;
+        }
+        if (massEditForm.changePassword) {
+            settingsFields.changePassword = true;
+            settingsFields.password = massEditForm.password;
+        }
+        const instanceType = massEditForm.instanceType.trim();
+
+        setMassEditBusy(true);
+        try {
+            if (Object.keys(settingsFields).length) {
+                const res = await fetch(`${API_BASE}/ec2-settings/bulk`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ instanceIds: ids, ...settingsFields })
+                });
+                if (!res.ok) throw new Error(await readErrorMessage(res));
+            }
+            if (instanceType) {
+                const res = await fetch(`${API_BASE}/instances/type/bulk`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ instanceIds: ids, instanceType })
+                });
+                if (!res.ok) throw new Error(await readErrorMessage(res));
+                const data: { results: { id: string; success: boolean; error?: string }[] } = await res.json();
+                const failed = data.results.filter(r => !r.success);
+                if (failed.length) {
+                    const names = failed.map(f => instances.find(i => i.id === f.id)?.label || instances.find(i => i.id === f.id)?.name || f.id);
+                    pushToast(`Instance type unchanged for ${failed.length}: ${names.join(', ')} (${failed[0].error})`, 'error');
+                }
+            }
+            pushToast(`Applied mass edit to ${ids.length} instance${ids.length > 1 ? 's' : ''}`, 'success');
+            setMassEditModal(false);
+            await fetchInstances();
+        } catch (err: any) {
+            pushToast(`Mass edit failed: ${err.message}`, 'error');
+        } finally {
+            setMassEditBusy(false);
+        }
+    };
+
+    const confirmMassEdit = () => {
+        const ids = Object.keys(massEditForm.selected).filter(id => massEditForm.selected[id]);
+        if (!ids.length) { pushToast('Select at least one instance', 'error'); return; }
+        const changes: string[] = [];
+        if (massEditForm.username.trim()) changes.push(`username → "${massEditForm.username.trim()}"`);
+        if (massEditForm.os !== '__nochange__') changes.push(`OS → ${massEditForm.os || 'None'}`);
+        if (massEditForm.changePassword) changes.push('password');
+        if (massEditForm.instanceType.trim()) changes.push(`instance type → ${massEditForm.instanceType.trim()}`);
+        if (!changes.length) { pushToast('No changes to apply — every field is blank', 'error'); return; }
+        setConfirm({
+            title: 'Mass edit EC2 instances',
+            message: `Apply ${changes.join(', ')} to ${ids.length} instance${ids.length > 1 ? 's' : ''}. Fields left blank above stay unchanged. Continue?`,
+            confirmLabel: `Apply to ${ids.length}`,
+            onConfirm: applyMassEdit
+        });
     };
 
     const handleDeleteCustom = async (id: string) => {
@@ -2107,6 +2233,13 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                         <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
                                     </button>
                                     <button
+                                        onClick={openMassEdit}
+                                        title="Mass edit instances"
+                                        className="p-1 rounded text-slate-400 hover:bg-slate-500/20 hover:text-white"
+                                    >
+                                        <SlidersHorizontal size={16} />
+                                    </button>
+                                    <button
                                         onClick={() => startInstances(stoppedEc2Ids)}
                                         disabled={loading || stoppedEc2Ids.length === 0}
                                         title="Start all stopped instances"
@@ -2436,11 +2569,20 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                 sits above it. Resizing is an AWS-side change applied on its own,
                 not part of saving the local overrides underneath. */}
             {typeModal && (() => {
+                const isMass = typeModal.mode === 'mass';
+                const massIds = isMass ? Object.keys(massEditForm.selected).filter(id => massEditForm.selected[id]) : [];
                 // Read from the live list so a stop made while this is open
-                // clears the "must be stopped" notice on its own.
-                const inst = instances.find(i => i.id === typeModal.instanceId);
+                // clears the "must be stopped" notice on its own. In mass
+                // mode there's no single instance being resized — `inst` here
+                // is just the representative one the catalogue/pricing/current
+                // type were sourced from.
+                const inst = typeModal.mode === 'single'
+                    ? instances.find(i => i.id === typeModal.instanceId)
+                    : instances.find(i => massIds.includes(i.id));
                 const current = inst?.instanceType || '';
-                const canResize = inst?.state === 'stopped';
+                // Mass mode can't gate on one instance's power state — each
+                // selected instance is checked independently when applied.
+                const canResize = isMass ? true : inst?.state === 'stopped';
                 const all = instanceTypes || [];
                 const currentSpec = all.find(t => t.name === current);
                 const q = typeSearch.trim().toLowerCase();
@@ -2509,7 +2651,9 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                             <div>
                                 <h3 className="text-lg font-semibold text-white flex items-center gap-2"><Cpu size={18} /> Instance Type</h3>
                                 <p className="text-xs text-slate-500 mt-0.5">
-                                    {inst ? (inst.label || inst.name) : typeModal.instanceId}
+                                    {isMass
+                                        ? `Applies to ${massIds.length} selected instance${massIds.length !== 1 ? 's' : ''} — specs shown for ${inst ? (inst.label || inst.name) : '—'}`
+                                        : (inst ? (inst.label || inst.name) : typeModal.instanceId)}
                                     {inst?.architecture && <span className="font-mono ml-2">{inst.architecture}</span>}
                                     {inst?.az && <span className="font-mono ml-2">{inst.az}</span>}
                                 </p>
@@ -2522,7 +2666,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                             <div className="bg-slate-950 border border-slate-700 rounded p-3">
                                 <div className="flex items-center justify-between">
                                     <span className="font-mono text-white text-base">{current || '—'}</span>
-                                    <span className="text-xs text-slate-500 uppercase tracking-wider">Current</span>
+                                    <span className="text-xs text-slate-500 uppercase tracking-wider">{isMass ? 'Reference' : 'Current'}</span>
                                 </div>
                                 {currentSpec ? (
                                     <>
@@ -2670,7 +2814,12 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                         </div>
 
                         <div className="p-6 pt-4 shrink-0 border-t border-slate-800 mt-2">
-                            {!canResize && (
+                            {isMass ? (
+                                <p className="text-xs text-slate-500 mb-3 flex items-start gap-2">
+                                    <AlertTriangle size={14} className="shrink-0 mt-0.5 text-amber-400/90" />
+                                    Applies only to selected instances that are stopped and support this type — others are skipped and reported when the mass edit is applied.
+                                </p>
+                            ) : !canResize && (
                                 <p className="text-xs text-amber-400/90 mb-3 flex items-start gap-2">
                                     <AlertTriangle size={14} className="shrink-0 mt-0.5" />
                                     The instance must be stopped before its type can be changed — it is currently '{inst?.state || 'unknown'}'.
@@ -2687,14 +2836,144 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                 <button type="button" onClick={() => setTypeModal(null)} className="px-4 py-2 text-sm text-slate-300 hover:text-white">Cancel</button>
                                 <button
                                     type="button"
-                                    onClick={() => changeInstanceType(typeModal.instanceId, typeSelection)}
-                                    disabled={!canResize || !typeSelection || typeSelection === current || changingType}
+                                    onClick={() => {
+                                        if (typeModal.mode === 'mass') {
+                                            setMassEditForm(prev => ({ ...prev, instanceType: typeSelection }));
+                                            setTypeModal(null);
+                                            return;
+                                        }
+                                        changeInstanceType(typeModal.instanceId, typeSelection);
+                                    }}
+                                    disabled={!typeSelection || (!isMass && (!canResize || typeSelection === current || changingType))}
                                     className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-500 text-white rounded flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-blue-600"
                                 >
                                     {changingType && <Loader2 size={14} className="animate-spin" />}
-                                    {typeSelection && typeSelection !== current ? `Change to ${typeSelection}` : 'Change type'}
+                                    {isMass
+                                        ? (typeSelection ? `Use ${typeSelection}` : 'Select a type')
+                                        : (typeSelection && typeSelection !== current ? `Change to ${typeSelection}` : 'Change type')}
                                 </button>
                             </div>
+                        </div>
+                    </div>
+                </div>
+                );
+            })()}
+
+            {/* Mass Edit Modal — apply the same instance type / OS / username /
+                password change to many EC2 instances at once. Every field below
+                defaults to "leave unchanged"; only fields the user actually
+                fills in get applied (see applyMassEdit). */}
+            {massEditModal && (() => {
+                const ids = Object.keys(massEditForm.selected).filter(id => massEditForm.selected[id]);
+                const allSelected = instances.length > 0 && ids.length === instances.length;
+                const toggleAll = () => setMassEditForm({
+                    ...massEditForm,
+                    selected: Object.fromEntries(instances.map(i => [i.id, !allSelected]))
+                });
+                return (
+                <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center">
+                    <div className="bg-slate-900 border border-slate-700 p-6 rounded-lg shadow-2xl w-full max-w-md">
+                        <div className="flex justify-between items-center mb-4">
+                            <h3 className="text-lg font-semibold text-white">Mass Edit EC2 Instances</h3>
+                            <button type="button" onClick={() => setMassEditModal(false)} className="text-slate-400 hover:text-white"><X size={20}/></button>
+                        </div>
+                        <div className="space-y-4">
+                            <div>
+                                <div className="flex items-center justify-between mb-1">
+                                    <label className="block text-xs text-slate-400">Instances ({ids.length} of {instances.length} selected)</label>
+                                    <button type="button" onClick={toggleAll} className="text-xs text-blue-400 hover:text-blue-300">
+                                        {allSelected ? 'Select none' : 'Select all'}
+                                    </button>
+                                </div>
+                                <div className="max-h-36 overflow-y-auto border border-slate-700 rounded p-2 space-y-1">
+                                    {instances.map(inst => (
+                                        <label key={inst.id} className="flex items-center gap-2 text-sm text-slate-300 cursor-pointer select-none py-0.5">
+                                            <input
+                                                type="checkbox"
+                                                className="w-4 h-4 shrink-0"
+                                                checked={!!massEditForm.selected[inst.id]}
+                                                onChange={e => setMassEditForm({ ...massEditForm, selected: { ...massEditForm.selected, [inst.id]: e.target.checked } })}
+                                            />
+                                            <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${inst.state === 'running' ? 'bg-green-500' : 'bg-slate-500'}`}></span>
+                                            <span className="truncate">{inst.label || inst.name}</span>
+                                        </label>
+                                    ))}
+                                </div>
+                            </div>
+                            <p className="text-xs text-slate-500 -mt-2">Leave a field below blank (or on "No change") to skip it — only the fields you fill in are applied.</p>
+                            <div>
+                                <label className="block text-xs text-slate-400 mb-1">Instance Type</label>
+                                <button
+                                    type="button"
+                                    onClick={openMassTypeModal}
+                                    disabled={ids.length === 0}
+                                    className="w-full bg-slate-950 border border-slate-700 rounded p-2 flex items-center justify-between hover:border-blue-500 transition-colors group/type disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-slate-700"
+                                >
+                                    <span className="font-mono text-white">{massEditForm.instanceType || 'No change'}</span>
+                                    <span className="text-xs text-slate-500 group-hover/type:text-blue-400 flex items-center gap-1">
+                                        <Cpu size={13} /> Change
+                                    </span>
+                                </button>
+                                <p className="text-xs text-slate-500 mt-1">Each selected instance must be stopped and support the type — others are skipped and reported.</p>
+                            </div>
+                            <div>
+                                <label className="block text-xs text-slate-400 mb-1">Operating System</label>
+                                <select
+                                    className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500"
+                                    value={massEditForm.os}
+                                    onChange={e => setMassEditForm({ ...massEditForm, os: e.target.value as typeof massEditForm.os, swapKeys: e.target.value === 'macos' ? massEditForm.swapKeys : false })}
+                                >
+                                    <option value="__nochange__">No change</option>
+                                    <option value="">None</option>
+                                    <option value="windows">Windows</option>
+                                    <option value="macos">macOS</option>
+                                    <option value="linux">Linux</option>
+                                </select>
+                                {massEditForm.os === 'macos' && (
+                                    <label className="flex items-center gap-2 text-sm text-slate-300 mt-2 cursor-pointer select-none">
+                                        <input type="checkbox" className="w-4 h-4" checked={massEditForm.swapKeys} onChange={e => setMassEditForm({ ...massEditForm, swapKeys: e.target.checked })} />
+                                        Swap Ctrl / Cmd
+                                    </label>
+                                )}
+                            </div>
+                            <div>
+                                <label className="block text-xs text-slate-400 mb-1">Username</label>
+                                <input
+                                    type="text"
+                                    className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500"
+                                    value={massEditForm.username}
+                                    onChange={e => setMassEditForm({ ...massEditForm, username: e.target.value })}
+                                    placeholder="Leave blank for no change"
+                                />
+                            </div>
+                            <div>
+                                <label className="flex items-center gap-2 text-sm text-slate-300 mb-2 cursor-pointer select-none">
+                                    <input type="checkbox" className="w-4 h-4" checked={massEditForm.changePassword} onChange={e => setMassEditForm({ ...massEditForm, changePassword: e.target.checked, password: '' })} />
+                                    Change password
+                                </label>
+                                {massEditForm.changePassword && (
+                                    <input
+                                        type="password"
+                                        autoFocus
+                                        className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500"
+                                        value={massEditForm.password}
+                                        onChange={e => setMassEditForm({ ...massEditForm, password: e.target.value })}
+                                        placeholder="Leave blank to use key.pem"
+                                    />
+                                )}
+                            </div>
+                        </div>
+                        <div className="mt-6 flex justify-end gap-3">
+                            <button type="button" onClick={() => setMassEditModal(false)} className="px-4 py-2 text-sm text-slate-300 hover:text-white">Cancel</button>
+                            <button
+                                type="button"
+                                onClick={confirmMassEdit}
+                                disabled={massEditBusy || ids.length === 0}
+                                className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-500 text-white rounded flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-blue-600"
+                            >
+                                {massEditBusy && <Loader2 size={14} className="animate-spin" />}
+                                Apply to {ids.length}
+                            </button>
                         </div>
                     </div>
                 </div>

@@ -421,6 +421,25 @@ app.put('/api/ec2-settings/:id', async (req, res) => {
     }
 });
 
+// Apply the same override(s) to many instances at once. Only the fields
+// actually present in the body are touched — same "omitted means leave
+// alone" semantics as upsertEc2Setting itself, so a mass edit that only sets
+// e.g. username doesn't clobber every instance's OS/password.
+app.put('/api/ec2-settings/bulk', async (req, res) => {
+    const { instanceIds, username, os, swapKeys, changePassword, password } = req.body;
+    if (!Array.isArray(instanceIds) || instanceIds.length === 0) {
+        return res.status(400).json({ error: 'No instance IDs provided' });
+    }
+    try {
+        for (const id of instanceIds) {
+            await upsertEc2Setting(id, { username, os, swapKeys, changePassword, password });
+        }
+        res.json({ success: true, updated: instanceIds.length });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.post('/api/connect', async (req, res) => {
     try {
         const { instanceId, customId, settings = {} } = req.body;
@@ -881,6 +900,39 @@ app.post('/api/instances/:id/type', async (req, res) => {
         console.error('Error changing instance type:', err);
         res.status(500).json({ error: err.message });
     }
+});
+
+// Resize many instances to the same type in one go. Each is attempted
+// independently (an instance still running, or a type unsupported on its
+// architecture, shouldn't abort the rest) — the response reports per-instance
+// success so the caller can show exactly which ones didn't take.
+app.post('/api/instances/type/bulk', async (req, res) => {
+    const { instanceIds, instanceType } = req.body;
+    if (!instanceType) return res.status(400).json({ error: 'No instance type provided' });
+    if (!Array.isArray(instanceIds) || instanceIds.length === 0) {
+        return res.status(400).json({ error: 'No instance IDs provided' });
+    }
+    const results: { id: string; success: boolean; error?: string }[] = [];
+    for (const id of instanceIds) {
+        try {
+            const describe = await ec2.send(new DescribeInstancesCommand({ InstanceIds: [id] }));
+            const inst = describe.Reservations?.[0]?.Instances?.[0];
+            if (!inst) { results.push({ id, success: false, error: 'Instance not found' }); continue; }
+            if (inst.InstanceType === instanceType) { results.push({ id, success: true }); continue; }
+            if (inst.State?.Name !== 'stopped') {
+                results.push({ id, success: false, error: `must be stopped — currently '${inst.State?.Name || 'unknown'}'` });
+                continue;
+            }
+            await ec2.send(new ModifyInstanceAttributeCommand({
+                InstanceId: id,
+                InstanceType: { Value: instanceType }
+            }));
+            results.push({ id, success: true });
+        } catch (err: any) {
+            results.push({ id, success: false, error: err.message });
+        }
+    }
+    res.json({ results });
 });
 
 // Serve the built frontend. Must come after the /api/* routes above so those
