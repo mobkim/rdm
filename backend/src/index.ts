@@ -573,6 +573,14 @@ app.post('/api/connect', async (req, res) => {
                     password: dynamicPassword || '',
                     security: 'nla',
                     'ignore-cert': 'true',
+                    // Without this, guacd falls back to its "failsafe" keymap,
+                    // which sends modifiers (Ctrl) as real key events but
+                    // printable characters as raw Unicode insertion — so the
+                    // RDP server never sees a combined "Ctrl+C" keystroke, just
+                    // Ctrl held plus a literal "c" character, and shortcuts
+                    // silently fail to fire. Pinning a real scancode-based
+                    // layout fixes Ctrl/Alt shortcuts (copy/paste, Alt+Tab, etc).
+                    'server-layout': 'en-us-qwerty',
                     width: '1920',
                     height: '1080',
                     // Otherwise guacd is free to renegotiate the session
