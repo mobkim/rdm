@@ -337,6 +337,36 @@ docker build -t guacamole/guacd:1.6.0-clip6m \
 ```
 Then run that tag instead of `guacamole/guacd` in step 2.
 
+### VNC needs a second patch
+
+Raising `GUAC_COMMON_CLIPBOARD_MAX_LENGTH` is enough for RDP, but **not** for
+VNC. guacd's VNC support is built on LibVNCClient, which refuses any
+`ServerCutText` message larger than 1 MiB — and refuses it by returning `FALSE`
+out of `HandleRFBServerMessage` rather than by ignoring the message. guacd reads
+that as a fatal protocol error and calls `guac_client_abort()`, so **copying more
+than 1 MiB of text inside a VNC session kills the session**: guacd logs
+
+```
+ERROR:	Error handling message from VNC server.
+```
+
+and the browser is told only `Aborted. See logs.` (`guac_client_abort` deliberately
+withholds the detail from the client). The same 1 MiB cap applies to the
+zlib/UTF-8 "extended clipboard" variant, where it bounds the *uncompressed* size.
+
+`guacd/Dockerfile` layers a rebuilt `libvncclient` with both caps raised to match
+onto the image from the previous step, so an oversized clipboard is truncated the
+way RDP's already is instead of dropping the connection:
+
+```bash
+docker build -t guacamole/guacd:1.6.0-clip6m-vncclip guacd/
+```
+
+Keep the cap equal to `GUAC_COMMON_CLIPBOARD_MAX_LENGTH` — guacd copies the text
+into a stack buffer of exactly that size in both directions
+(`guac_vnc_cut_text` / `guac_vnc_clipboard_end_handler`), so the 8 MiB thread
+stack is the real ceiling, and guacd truncates anything past the cap regardless.
+
 ## Notes & limitations
 
 - **File copy/paste is not supported** — Guacamole's clipboard is text-only.

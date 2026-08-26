@@ -389,6 +389,10 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, layoutVersio
         // best-effort write to the OS clipboard so it can be pasted into local apps.
         // Registered *before* connect() so a clipboard instruction that arrives
         // early in the handshake isn't dropped.
+        // Nothing arrives here for an oversized VNC copy: LibVNCClient treats a
+        // ServerCutText past its cap as a fatal protocol error, so guacd aborts
+        // the session instead of forwarding it. See "VNC needs a second patch"
+        // in the README — the fix is in the guacd image, not here.
         client.onclipboard = (stream, mimetype) => {
             if (mimetype === 'text/plain') {
                 const reader = new Guacamole.StringReader(stream);
@@ -442,7 +446,7 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, layoutVersio
     // close the stream. (An earlier ack-gated version stalled after the first
     // chunk because guacd does not ack every clipboard blob, which truncated
     // long text — do not reintroduce that.) The real length ceiling is guacd's
-    // GUAC_COMMON_CLIPBOARD_MAX_LENGTH, raised to 2 MiB in the custom image.
+    // GUAC_COMMON_CLIPBOARD_MAX_LENGTH, raised to 6 MiB in the custom image.
     const sendClipboard = (text: string) => {
         const client = clientRef.current;
         if (!client || text === lastClipboard.current) return;
