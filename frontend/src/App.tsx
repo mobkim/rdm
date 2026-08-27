@@ -171,8 +171,13 @@ interface EC2Instance {
     privateIp?: string;
     // User-set overrides (see backend ec2_settings)
     label?: string;
-    username?: string;
-    hasPassword?: boolean;
+    protocol?: Protocol;
+    // Each protocol keeps its own credentials — RustDesk has no username.
+    rdpUsername?: string;
+    rdpHasPassword?: boolean;
+    vncUsername?: string;
+    vncHasPassword?: boolean;
+    rustdeskHasPassword?: boolean;
     os?: '' | 'windows' | 'macos' | 'linux';
     swapKeys?: boolean;
 }
@@ -476,8 +481,10 @@ interface CustomInstance {
     rustdeskHasPassword?: boolean;
 }
 
-// Pulls whichever protocol's saved username/hasPassword out of a CustomInstance.
-const credsForProtocol = (inst: CustomInstance, protocol: Protocol): { username: string; hasPassword: boolean } => {
+// Pulls whichever protocol's saved username/hasPassword out of a CustomInstance
+// or EC2Instance — both keep the same per-protocol field names.
+type ProtocolCreds = { rdpUsername?: string; rdpHasPassword?: boolean; vncUsername?: string; vncHasPassword?: boolean; rustdeskHasPassword?: boolean };
+const credsForProtocol = (inst: ProtocolCreds, protocol: Protocol): { username: string; hasPassword: boolean } => {
     switch (protocol) {
         case 'vnc':
             return { username: inst.vncUsername || 'Administrator', hasPassword: !!inst.vncHasPassword };
@@ -916,6 +923,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
     const [massEditForm, setMassEditForm] = useState({
         selected: {} as Record<string, boolean>,
         instanceType: '',
+        protocol: '__nochange__' as '__nochange__' | Protocol,
         os: '__nochange__' as '__nochange__' | '' | 'windows' | 'macos' | 'linux',
         swapKeys: false,
         username: '',
@@ -1411,14 +1419,21 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
     };
 
     const openEditEc2 = (inst: EC2Instance) => {
+        const protocol = inst.protocol || 'rdp';
+        const savedCreds: Record<Protocol, { username: string; hasPassword: boolean }> = {
+            rdp: credsForProtocol(inst, 'rdp'),
+            vnc: credsForProtocol(inst, 'vnc'),
+            rustdesk: credsForProtocol(inst, 'rustdesk')
+        };
+        const current = savedCreds[protocol];
         setInstanceForm({
             name: inst.label || inst.name,
             ip: inst.publicIp || inst.privateIp || '',
-            username: inst.username || 'Administrator',
-            protocol: 'rdp',
+            username: current.username,
+            protocol,
             os: inst.os || '', swapKeys: !!inst.swapKeys,
-            password: '', changePassword: false, hasPassword: !!inst.hasPassword,
-            savedCreds: emptyCreds()
+            password: '', changePassword: false, hasPassword: current.hasPassword,
+            savedCreds
         });
         setInstanceModal({ mode: 'edit-ec2', id: inst.id });
     };
@@ -1603,7 +1618,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                 await fetch(`${API_BASE}/ec2-settings/${instanceModal.id}`, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ label: f.name, username: f.username, os: f.os, swapKeys: f.swapKeys, changePassword: f.changePassword, password: f.password })
+                    body: JSON.stringify({ label: f.name, protocol: f.protocol, username: f.username, os: f.os, swapKeys: f.swapKeys, changePassword: f.changePassword, password: f.password })
                 });
             }
             await Promise.all([fetchCustomInstances(), fetchInstances()]);
@@ -1617,6 +1632,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         setMassEditForm({
             selected: Object.fromEntries(instances.map(i => [i.id, true])),
             instanceType: '',
+            protocol: '__nochange__',
             os: '__nochange__',
             swapKeys: false,
             username: '',
@@ -1628,15 +1644,19 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
 
     // Applies whichever fields were actually touched to every selected
     // instance. Instance type is a live AWS resize (its own endpoint,
-    // per-instance results); username/OS/password are local DB overrides
-    // (one bulk upsert). Omitting an untouched field from the request bodies
-    // is what makes upsertEc2Setting leave it alone — see its `??` fallbacks.
+    // per-instance results); protocol/username/OS/password are local DB
+    // overrides (one bulk upsert). Omitting an untouched field from the
+    // request bodies is what makes upsertEc2Setting leave it alone — see its
+    // `??` fallbacks. A username sent alongside a protocol change lands on
+    // that new protocol's own column (see upsertEc2Setting), so switching
+    // protocol and setting a username in the same mass edit works as expected.
     const applyMassEdit = async () => {
         const ids = Object.keys(massEditForm.selected).filter(id => massEditForm.selected[id]);
         if (!ids.length) return;
 
-        const settingsFields: { username?: string; os?: string; swapKeys?: boolean; changePassword?: boolean; password?: string } = {};
-        if (massEditForm.username.trim()) settingsFields.username = massEditForm.username.trim();
+        const settingsFields: { protocol?: string; username?: string; os?: string; swapKeys?: boolean; changePassword?: boolean; password?: string } = {};
+        if (massEditForm.protocol !== '__nochange__') settingsFields.protocol = massEditForm.protocol;
+        if (massEditForm.protocol !== 'rustdesk' && massEditForm.username.trim()) settingsFields.username = massEditForm.username.trim();
         if (massEditForm.os !== '__nochange__') {
             settingsFields.os = massEditForm.os;
             if (massEditForm.os === 'macos') settingsFields.swapKeys = massEditForm.swapKeys;
@@ -1685,7 +1705,8 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         const ids = Object.keys(massEditForm.selected).filter(id => massEditForm.selected[id]);
         if (!ids.length) { pushToast('Select at least one instance', 'error'); return; }
         const changes: string[] = [];
-        if (massEditForm.username.trim()) changes.push(`username → "${massEditForm.username.trim()}"`);
+        if (massEditForm.protocol !== '__nochange__') changes.push(`protocol → ${massEditForm.protocol.toUpperCase()}`);
+        if (massEditForm.protocol !== 'rustdesk' && massEditForm.username.trim()) changes.push(`username → "${massEditForm.username.trim()}"`);
         if (massEditForm.os !== '__nochange__') changes.push(`OS → ${massEditForm.os || 'None'}`);
         if (massEditForm.changePassword) changes.push('password');
         if (massEditForm.instanceType.trim()) changes.push(`instance type → ${massEditForm.instanceType.trim()}`);
@@ -1968,6 +1989,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         const ip = custom?.ip || ec2?.publicIp || ec2?.privateIp || session.ip;
         const os = custom?.os || ec2?.os || '';
         const swapCtrlCmd = os === 'macos' && !!(custom?.swapKeys || ec2?.swapKeys);
+        const protocol: Protocol = custom?.protocol || ec2?.protocol || 'rdp';
         const isDropTarget = dragOverId === session.instanceId && dragId !== session.instanceId;
         const isMaximized = maximizedId === session.instanceId;
         // Other panes stay mounted while one is maximized — just hidden —
@@ -1994,7 +2016,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
             onDrop={(e) => { e.preventDefault(); reorderSession(dragId, session.instanceId); setDragId(null); setDragOverId(null); }}
             className={`flex items-center justify-center min-w-0 rounded-lg transition-[opacity,transform,box-shadow] duration-150 ease-out ${gridLayout === 4 ? 'overflow-hidden' : 'min-h-[240px]'} ${gridLayout === 3 ? 'min-w-full shrink-0 snap-center h-full' : ''} ${singleViewFit ? 'w-full shrink-0 h-full' : ''} ${isDropTarget ? 'ring-2 ring-blue-400 ring-offset-2 ring-offset-black scale-[1.015]' : ''} ${dragId === session.instanceId ? 'opacity-40 scale-[0.97]' : ''} ${isMaximized ? 'absolute inset-0 z-20 overflow-hidden' : ''} ${isHiddenByMaximize ? 'hidden' : ''}`}
         >
-            {custom?.protocol === 'rustdesk' ? (
+            {protocol === 'rustdesk' ? (
                 <RustDeskClient
                     instanceId={session.instanceId}
                     token={session.token}
@@ -2023,7 +2045,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                     layoutVersion={resizeSignal}
                     fitViewport={gridLayout !== 1 || singleViewFit}
                     onToggleMaximize={toggleMaximize}
-                    protocol={custom?.protocol || 'rdp'}
+                    protocol={protocol}
                     os={os}
                     swapCtrlCmd={swapCtrlCmd}
                     focusOnHover={focusOnHover}
@@ -2456,36 +2478,35 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                 />
                                 {isEc2 && <p className="text-xs text-slate-500 mt-1">Managed by AWS — updates automatically.</p>}
                             </div>
-                            {!isEc2 && (
-                                <div>
-                                    <label className="block text-xs text-slate-400 mb-1">Protocol</label>
-                                    <select
-                                        className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500"
-                                        value={instanceForm.protocol}
-                                        onChange={e => {
-                                            const protocol = e.target.value as Protocol;
-                                            // Each protocol has its own saved username/password — show that
-                                            // protocol's own state instead of carrying over the previous one's.
-                                            const creds = instanceForm.savedCreds[protocol];
-                                            setInstanceForm({...instanceForm, protocol, username: creds.username, hasPassword: creds.hasPassword, password: '', changePassword: false});
-                                        }}
-                                    >
-                                        <option value="rdp">RDP (port 3389)</option>
-                                        <option value="vnc">VNC (port 5900)</option>
-                                        <option value="rustdesk">RustDesk (port 21118)</option>
-                                    </select>
-                                    {instanceForm.protocol === 'vnc' && (
-                                        <p className="text-xs text-slate-500 mt-1">
-                                            Most VNC servers (e.g. UltraVNC) refuse all connections with a blank password — set one below even if the server's real auth is MS-Logon.
-                                        </p>
-                                    )}
-                                    {instanceForm.protocol === 'rustdesk' && (
-                                        <p className="text-xs text-slate-500 mt-1">
-                                            On the target machine: RustDesk → Settings → Network → unlock and enable "Direct IP Access", and Settings → Security → set a permanent password (that password goes below). Only works when rdm can reach that IP directly — no relay/rendezvous server involved.
-                                        </p>
-                                    )}
-                                </div>
-                            )}
+                            <div>
+                                <label className="block text-xs text-slate-400 mb-1">Protocol</label>
+                                <select
+                                    className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500"
+                                    value={instanceForm.protocol}
+                                    onChange={e => {
+                                        const protocol = e.target.value as Protocol;
+                                        // Each protocol has its own saved username/password — show that
+                                        // protocol's own state instead of carrying over the previous one's.
+                                        const creds = instanceForm.savedCreds[protocol];
+                                        setInstanceForm({...instanceForm, protocol, username: creds.username, hasPassword: creds.hasPassword, password: '', changePassword: false});
+                                    }}
+                                >
+                                    <option value="rdp">RDP (port 3389)</option>
+                                    <option value="vnc">VNC (port 5900)</option>
+                                    <option value="rustdesk">RustDesk (port 21118)</option>
+                                </select>
+                                {instanceForm.protocol === 'vnc' && (
+                                    <p className="text-xs text-slate-500 mt-1">
+                                        Most VNC servers (e.g. UltraVNC) refuse all connections with a blank password — set one below even if the server's real auth is MS-Logon.
+                                    </p>
+                                )}
+                                {instanceForm.protocol === 'rustdesk' && (
+                                    <p className="text-xs text-slate-500 mt-1">
+                                        On the target machine: RustDesk → Settings → Network → unlock and enable "Direct IP Access", and Settings → Security → set a permanent password (that password goes below). Only works when rdm can reach that IP directly — no relay/rendezvous server involved.
+                                        {isEc2 && " Uses the instance's public/private IP above — key.pem auto-decrypt doesn't apply to this protocol."}
+                                    </p>
+                                )}
+                            </div>
                             <div>
                                 <label className="block text-xs text-slate-400 mb-1">Operating System</label>
                                 <select
@@ -2545,11 +2566,11 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                             {instanceForm.hasPassword && !instanceForm.changePassword && <span className="text-xs text-emerald-400/80 ml-1">(a password is saved)</span>}
                                         </label>
                                         {instanceForm.changePassword && (
-                                            <input type="password" autoFocus className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500" value={instanceForm.password} onChange={e => setInstanceForm({...instanceForm, password: e.target.value})} placeholder={isEc2 ? 'Leave blank to use key.pem' : 'New password'} />
+                                            <input type="password" autoFocus className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500" value={instanceForm.password} onChange={e => setInstanceForm({...instanceForm, password: e.target.value})} placeholder={isEc2 && instanceForm.protocol === 'rdp' ? 'Leave blank to use key.pem' : 'New password'} />
                                         )}
                                     </>
                                 )}
-                                {isEc2 && (
+                                {isEc2 && instanceForm.protocol === 'rdp' && (
                                     <p className="text-xs text-slate-500 mt-1">
                                         For AWS instances the password can be left blank — it's auto-decrypted from your <code className="text-slate-400">key.pem</code> (or <code className="text-slate-400">RDP_PASSWORD</code>). Set one here only to override.
                                     </p>
@@ -2902,19 +2923,27 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                             </div>
                             <p className="text-xs text-slate-500 -mt-2">Leave a field below blank (or on "No change") to skip it — only the fields you fill in are applied.</p>
                             <div>
-                                <label className="block text-xs text-slate-400 mb-1">Instance Type</label>
-                                <button
-                                    type="button"
-                                    onClick={openMassTypeModal}
-                                    disabled={ids.length === 0}
-                                    className="w-full bg-slate-950 border border-slate-700 rounded p-2 flex items-center justify-between hover:border-blue-500 transition-colors group/type disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-slate-700"
+                                <label className="block text-xs text-slate-400 mb-1">Protocol</label>
+                                <select
+                                    className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500"
+                                    value={massEditForm.protocol}
+                                    onChange={e => setMassEditForm({ ...massEditForm, protocol: e.target.value as typeof massEditForm.protocol })}
                                 >
-                                    <span className="font-mono text-white">{massEditForm.instanceType || 'No change'}</span>
-                                    <span className="text-xs text-slate-500 group-hover/type:text-blue-400 flex items-center gap-1">
-                                        <Cpu size={13} /> Change
-                                    </span>
-                                </button>
-                                <p className="text-xs text-slate-500 mt-1">Each selected instance must be stopped and support the type — others are skipped and reported.</p>
+                                    <option value="__nochange__">No change</option>
+                                    <option value="rdp">RDP (port 3389)</option>
+                                    <option value="vnc">VNC (port 5900)</option>
+                                    <option value="rustdesk">RustDesk (port 21118)</option>
+                                </select>
+                                {massEditForm.protocol === 'vnc' && (
+                                    <p className="text-xs text-slate-500 mt-1">
+                                        Most VNC servers (e.g. UltraVNC) refuse all connections with a blank password — set one below even if the server's real auth is MS-Logon.
+                                    </p>
+                                )}
+                                {massEditForm.protocol === 'rustdesk' && (
+                                    <p className="text-xs text-slate-500 mt-1">
+                                        Each instance needs "Direct IP Access" enabled and a permanent password set in RustDesk itself first — this only stages the password rdm connects with, it doesn't configure the instance.
+                                    </p>
+                                )}
                             </div>
                             <div>
                                 <label className="block text-xs text-slate-400 mb-1">Operating System</label>
@@ -2937,15 +2966,32 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                 )}
                             </div>
                             <div>
-                                <label className="block text-xs text-slate-400 mb-1">Username</label>
-                                <input
-                                    type="text"
-                                    className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500"
-                                    value={massEditForm.username}
-                                    onChange={e => setMassEditForm({ ...massEditForm, username: e.target.value })}
-                                    placeholder="Leave blank for no change"
-                                />
+                                <label className="block text-xs text-slate-400 mb-1">Instance Type</label>
+                                <button
+                                    type="button"
+                                    onClick={openMassTypeModal}
+                                    disabled={ids.length === 0}
+                                    className="w-full bg-slate-950 border border-slate-700 rounded p-2 flex items-center justify-between hover:border-blue-500 transition-colors group/type disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-slate-700"
+                                >
+                                    <span className="font-mono text-white">{massEditForm.instanceType || 'No change'}</span>
+                                    <span className="text-xs text-slate-500 group-hover/type:text-blue-400 flex items-center gap-1">
+                                        <Cpu size={13} /> Change
+                                    </span>
+                                </button>
+                                <p className="text-xs text-slate-500 mt-1">Each selected instance must be stopped and support the type — others are skipped and reported.</p>
                             </div>
+                            {massEditForm.protocol !== 'rustdesk' && (
+                                <div>
+                                    <label className="block text-xs text-slate-400 mb-1">Username</label>
+                                    <input
+                                        type="text"
+                                        className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500"
+                                        value={massEditForm.username}
+                                        onChange={e => setMassEditForm({ ...massEditForm, username: e.target.value })}
+                                        placeholder="Leave blank for no change"
+                                    />
+                                </div>
+                            )}
                             <div>
                                 <label className="flex items-center gap-2 text-sm text-slate-300 mb-2 cursor-pointer select-none">
                                     <input type="checkbox" className="w-4 h-4" checked={massEditForm.changePassword} onChange={e => setMassEditForm({ ...massEditForm, changePassword: e.target.checked, password: '' })} />
@@ -2958,7 +3004,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                         className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500"
                                         value={massEditForm.password}
                                         onChange={e => setMassEditForm({ ...massEditForm, password: e.target.value })}
-                                        placeholder="Leave blank to use key.pem"
+                                        placeholder={massEditForm.protocol === 'vnc' || massEditForm.protocol === 'rustdesk' ? 'New password' : 'Leave blank to use key.pem'}
                                     />
                                 )}
                             </div>

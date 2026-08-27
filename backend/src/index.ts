@@ -127,8 +127,12 @@ app.get('/api/instances', async (req, res) => {
                     // User-set custom identifier override (falls back to the AWS
                     // Name tag in the UI when empty).
                     label: ov?.label || '',
-                    username: ov?.username || '',
-                    hasPassword: ov?.hasPassword || false,
+                    protocol: ov?.protocol || 'rdp',
+                    rdpUsername: ov?.rdpUsername || '',
+                    rdpHasPassword: ov?.rdpHasPassword || false,
+                    vncUsername: ov?.vncUsername || '',
+                    vncHasPassword: ov?.vncHasPassword || false,
+                    rustdeskHasPassword: ov?.rustdeskHasPassword || false,
                     os: ov?.os || '',
                     swapKeys: ov?.swapKeys || false,
                     state: instance.State?.Name,
@@ -413,8 +417,8 @@ app.delete('/api/custom-instances/:id', async (req, res) => {
 // Leaving the password blank means "use key.pem / RDP_PASSWORD" at connect time.
 app.put('/api/ec2-settings/:id', async (req, res) => {
     try {
-        const { label, username, os, swapKeys, changePassword, password } = req.body;
-        await upsertEc2Setting(req.params.id, { label, username, os, swapKeys, changePassword, password });
+        const { label, protocol, username, os, swapKeys, changePassword, password } = req.body;
+        await upsertEc2Setting(req.params.id, { label, protocol, username, os, swapKeys, changePassword, password });
         res.json({ success: true });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
@@ -426,13 +430,13 @@ app.put('/api/ec2-settings/:id', async (req, res) => {
 // alone" semantics as upsertEc2Setting itself, so a mass edit that only sets
 // e.g. username doesn't clobber every instance's OS/password.
 app.put('/api/ec2-settings/bulk', async (req, res) => {
-    const { instanceIds, username, os, swapKeys, changePassword, password } = req.body;
+    const { instanceIds, protocol, username, os, swapKeys, changePassword, password } = req.body;
     if (!Array.isArray(instanceIds) || instanceIds.length === 0) {
         return res.status(400).json({ error: 'No instance IDs provided' });
     }
     try {
         for (const id of instanceIds) {
-            await upsertEc2Setting(id, { username, os, swapKeys, changePassword, password });
+            await upsertEc2Setting(id, { protocol, username, os, swapKeys, changePassword, password });
         }
         res.json({ success: true, updated: instanceIds.length });
     } catch (err: any) {
@@ -444,23 +448,53 @@ app.post('/api/connect', async (req, res) => {
     try {
         const { instanceId, customId, settings = {} } = req.body;
 
-        // RustDesk doesn't go through guacd/guacamole-lite at all, so its
-        // custom instance's protocol has to be resolved before the guacd
+        // RustDesk doesn't go through guacd/guacamole-lite at all, so
+        // whichever instance's protocol has to be resolved before the guacd
         // probe below (which only applies to the Guacamole RDP/VNC path)
         // rather than after it — otherwise a stopped guacd would wrongly
         // block a RustDesk connection that never needed it.
         let custom: any = null;
+        let ec2Setting: any = null;
         if (customId) {
             custom = await getCustomInstance(customId);
             if (!custom) {
                 return res.status(404).json({ error: 'Custom instance not found' });
             }
-            if (custom.protocol === 'rustdesk') {
-                const sessionId = createRustDeskSession({ host: custom.ip, password: custom.password || '' });
-                return res.json({ sessionId, instanceId: customId, protocol: 'rustdesk' });
-            }
-        } else if (!instanceId) {
+        } else if (instanceId) {
+            ec2Setting = await getEc2SettingFull(instanceId);
+        } else {
             return res.status(400).json({ error: 'Missing instanceId or customId' });
+        }
+
+        const protocol = custom ? (custom.protocol || 'rdp') : (ec2Setting?.protocol || 'rdp');
+
+        if (protocol === 'rustdesk') {
+            let host = '';
+            let password = '';
+            if (custom) {
+                host = custom.ip;
+                password = custom.password || '';
+            } else {
+                // Direct-IP RustDesk connects to the instance's real address,
+                // not through guacd/SSM — always resolve it the same way
+                // regardless of USE_SSM_TUNNEL, which only steers the RDP path.
+                const describeCmd = new DescribeInstancesCommand({ InstanceIds: [instanceId] });
+                const ec2Res = await ec2.send(describeCmd);
+                const inst = ec2Res.Reservations?.[0]?.Instances?.[0];
+                if (!inst) {
+                    return res.status(404).json({ error: 'Instance not found' });
+                }
+                host = inst.PublicIpAddress || inst.PrivateIpAddress || '';
+                if (!host) {
+                    return res.status(400).json({ error: 'Instance has no IP address' });
+                }
+                // No key.pem/GetPasswordData fallback here — that decrypts the
+                // Windows RDP Administrator password, which has no relation to
+                // a RustDesk permanent password set on the target machine.
+                password = ec2Setting?.password || '';
+            }
+            const sessionId = createRustDeskSession({ host, password });
+            return res.json({ sessionId, instanceId: instanceId || customId, protocol: 'rustdesk' });
         }
 
         // Checked before any of the work below, so a stopped guacd is reported as
@@ -471,20 +505,14 @@ app.post('/api/connect', async (req, res) => {
         }
 
         let rdpHostname = '';
-        let rdpPort = 3389;
+        let rdpPort = protocol === 'vnc' ? 5900 : 3389;
         let dynamicPassword = '';
         let username = process.env.AWS_RDP_USERNAME || 'Administrator';
-        // EC2 instances are always RDP (Windows Server, password via
-        // GetPasswordData) — only a custom instance can be VNC (or RustDesk,
-        // handled above).
-        let protocol = 'rdp';
 
         if (custom) {
             rdpHostname = custom.ip;
             dynamicPassword = custom.password || '';
             username = custom.username || 'Administrator';
-            protocol = custom.protocol || 'rdp';
-            if (protocol === 'vnc') rdpPort = 5900;
         } else if (instanceId) {
             if (USE_SSM_TUNNEL) {
                 rdpPort = await startSSMTunnel(instanceId);
@@ -508,14 +536,16 @@ app.post('/api/connect', async (req, res) => {
 
             // Per-instance overrides take priority: an explicit username and/or
             // a saved password entered in the instance settings modal.
-            const ec2Setting = await getEc2SettingFull(instanceId);
             if (ec2Setting?.username) username = ec2Setting.username;
 
             if (ec2Setting?.password) {
                 // User supplied a password explicitly — use it as-is.
                 dynamicPassword = ec2Setting.password;
-            } else {
-                // Blank password → auto-decrypt via key.pem, else RDP_PASSWORD.
+            } else if (protocol === 'rdp') {
+                // Blank RDP password → auto-decrypt via key.pem, else
+                // RDP_PASSWORD. Only meaningful for RDP — GetPasswordData
+                // decrypts the Windows Administrator password specifically,
+                // which a VNC server on the same box wouldn't be using.
                 const fetchedPassword = await getWindowsPassword(ec2, instanceId);
                 dynamicPassword = fetchedPassword || process.env.RDP_PASSWORD || '';
             }

@@ -88,23 +88,57 @@ export async function initDb() {
 
     // Per-EC2 credential/label overrides. EC2 instances are discovered from AWS
     // (not stored), so this table only holds the bits the user can edit: a
-    // display label ("custom identifier"), an RDP username, and an optional
-    // password. A blank/absent password means "fall back to key.pem / env".
+    // display label ("custom identifier"), a protocol (defaults to RDP, same
+    // as a fresh custom instance), and that protocol's username/password. A
+    // blank/absent RDP password means "fall back to key.pem / env" — that
+    // fallback only makes sense for RDP (see getEc2SettingFull), since it
+    // decrypts the Windows Administrator password AWS set at launch.
     await db.exec(`
         CREATE TABLE IF NOT EXISTS ec2_settings (
             instance_id TEXT PRIMARY KEY,
             label TEXT,
-            username TEXT,
-            encrypted_password TEXT
+            protocol TEXT NOT NULL DEFAULT 'rdp',
+            rdp_username TEXT NOT NULL DEFAULT '',
+            rdp_encrypted_password TEXT,
+            vnc_username TEXT NOT NULL DEFAULT '',
+            vnc_encrypted_password TEXT,
+            rustdesk_encrypted_password TEXT
         );
     `);
 
     const ec2Cols = await db.all(`PRAGMA table_info(ec2_settings)`);
-    if (!ec2Cols.some((c: any) => c.name === 'os')) {
+    const hasEc2Col = (name: string) => ec2Cols.some((c: any) => c.name === name);
+    if (!hasEc2Col('os')) {
         await db.exec(`ALTER TABLE ec2_settings ADD COLUMN os TEXT NOT NULL DEFAULT ''`);
     }
-    if (!ec2Cols.some((c: any) => c.name === 'swap_keys')) {
+    if (!hasEc2Col('swap_keys')) {
         await db.exec(`ALTER TABLE ec2_settings ADD COLUMN swap_keys INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!hasEc2Col('protocol')) {
+        await db.exec(`ALTER TABLE ec2_settings ADD COLUMN protocol TEXT NOT NULL DEFAULT 'rdp'`);
+    }
+    if (!hasEc2Col('rdp_username')) {
+        await db.exec(`ALTER TABLE ec2_settings ADD COLUMN rdp_username TEXT NOT NULL DEFAULT ''`);
+    }
+    if (!hasEc2Col('rdp_encrypted_password')) {
+        await db.exec(`ALTER TABLE ec2_settings ADD COLUMN rdp_encrypted_password TEXT`);
+    }
+    if (!hasEc2Col('vnc_username')) {
+        await db.exec(`ALTER TABLE ec2_settings ADD COLUMN vnc_username TEXT NOT NULL DEFAULT ''`);
+    }
+    if (!hasEc2Col('vnc_encrypted_password')) {
+        await db.exec(`ALTER TABLE ec2_settings ADD COLUMN vnc_encrypted_password TEXT`);
+    }
+    if (!hasEc2Col('rustdesk_encrypted_password')) {
+        await db.exec(`ALTER TABLE ec2_settings ADD COLUMN rustdesk_encrypted_password TEXT`);
+    }
+    // Pre-migration rows had one shared username/encrypted_password column,
+    // always for RDP (EC2 only ever spoke RDP before this) — fold it into
+    // rdp_username/rdp_encrypted_password, then drop the old columns.
+    if (hasEc2Col('username') && hasEc2Col('encrypted_password')) {
+        await db.exec(`UPDATE ec2_settings SET rdp_username = username, rdp_encrypted_password = encrypted_password`);
+        await db.exec(`ALTER TABLE ec2_settings DROP COLUMN username`);
+        await db.exec(`ALTER TABLE ec2_settings DROP COLUMN encrypted_password`);
     }
 
     // Single-user auth. `users` only ever holds one row — there's no
@@ -275,50 +309,88 @@ export async function deleteCustomInstance(id: string) {
 // ---------------------------------------------------------------------------
 
 // All stored EC2 overrides, keyed by instance id, for merging into the
-// discovered instance list. Passwords are never returned — only `hasPassword`.
-export async function getAllEc2Settings(): Promise<Record<string, { label: string; username: string; hasPassword: boolean; os: string; swapKeys: boolean }>> {
-    const rows = await db.all('SELECT instance_id, label, username, encrypted_password, os, swap_keys FROM ec2_settings');
-    const map: Record<string, { label: string; username: string; hasPassword: boolean; os: string; swapKeys: boolean }> = {};
+// discovered instance list. Passwords are never returned — only `hasPassword`,
+// per protocol, same shape as getCustomInstances.
+export async function getAllEc2Settings(): Promise<Record<string, {
+    label: string; protocol: string; os: string; swapKeys: boolean;
+    rdpUsername: string; rdpHasPassword: boolean;
+    vncUsername: string; vncHasPassword: boolean;
+    rustdeskHasPassword: boolean;
+}>> {
+    const rows = await db.all(
+        'SELECT instance_id, label, protocol, os, swap_keys, rdp_username, rdp_encrypted_password, vnc_username, vnc_encrypted_password, rustdesk_encrypted_password FROM ec2_settings'
+    );
+    const map: Record<string, any> = {};
     for (const r of rows) {
         map[r.instance_id] = {
             label: r.label || '',
-            username: r.username || '',
-            hasPassword: !!r.encrypted_password,
+            protocol: r.protocol || 'rdp',
             os: r.os || '',
-            swapKeys: !!r.swap_keys
+            swapKeys: !!r.swap_keys,
+            rdpUsername: r.rdp_username || '',
+            rdpHasPassword: !!r.rdp_encrypted_password,
+            vncUsername: r.vnc_username || '',
+            vncHasPassword: !!r.vnc_encrypted_password,
+            rustdeskHasPassword: !!r.rustdesk_encrypted_password
         };
     }
     return map;
 }
 
-// Full override (decrypted password) for one instance, used when building a
-// connection. Returns null if the user has never saved settings for it.
+// Full override (decrypted password, active protocol's credentials) for one
+// instance, used when building a connection. Returns null if the user has
+// never saved settings for it.
 export async function getEc2SettingFull(id: string) {
     const row = await db.get('SELECT * FROM ec2_settings WHERE instance_id = ?', [id]);
     if (!row) return null;
+    const protocol = row.protocol || 'rdp';
+    const { usernameCol, passwordCol } = credentialColumns(protocol);
     return {
         label: row.label || '',
-        username: row.username || '',
-        password: decrypt(row.encrypted_password)
+        protocol,
+        username: usernameCol ? (row[usernameCol] || '') : '',
+        password: decrypt(row[passwordCol])
     };
 }
 
+// Update an existing EC2 override. Only the active protocol's username and
+// (when `changePassword` is set) password columns are touched, so switching
+// an instance's protocol never wipes a different protocol's saved
+// credentials — same semantics as updateCustomInstance.
 export async function upsertEc2Setting(
     id: string,
-    fields: { label?: string; username?: string; os?: string; swapKeys?: boolean; changePassword?: boolean; password?: string }
+    fields: { label?: string; protocol?: string; username?: string; os?: string; swapKeys?: boolean; changePassword?: boolean; password?: string }
 ) {
     const existing = await db.get('SELECT * FROM ec2_settings WHERE instance_id = ?', [id]);
     const label = fields.label ?? existing?.label ?? '';
-    const username = fields.username ?? existing?.username ?? '';
+    const protocol = fields.protocol ?? existing?.protocol ?? 'rdp';
     const os = fields.os ?? existing?.os ?? '';
     const swapKeys = (fields.swapKeys ?? !!existing?.swap_keys) ? 1 : 0;
-    let encPass = existing?.encrypted_password ?? '';
+    const { usernameCol, passwordCol } = credentialColumns(protocol);
+
+    const username = usernameCol ? (fields.username ?? (existing?.[usernameCol] ?? '')) : '';
+    let encPass = (existing?.[passwordCol]) ?? '';
     if (fields.changePassword) {
         encPass = fields.password ? encrypt(fields.password) : '';
     }
+
+    // INSERT OR REPLACE resets every column not listed to its default, so the
+    // other two protocols' saved credentials have to be carried forward
+    // explicitly here rather than left out — otherwise switching protocol and
+    // saving would wipe whichever protocol wasn't active.
+    const cols: Record<string, string | null> = {
+        rdp_username: existing?.rdp_username ?? '',
+        rdp_encrypted_password: existing?.rdp_encrypted_password ?? null,
+        vnc_username: existing?.vnc_username ?? '',
+        vnc_encrypted_password: existing?.vnc_encrypted_password ?? null,
+        rustdesk_encrypted_password: existing?.rustdesk_encrypted_password ?? null
+    };
+    if (usernameCol) cols[usernameCol] = username;
+    cols[passwordCol] = encPass;
+
     await db.run(
-        'INSERT OR REPLACE INTO ec2_settings (instance_id, label, username, encrypted_password, os, swap_keys) VALUES (?, ?, ?, ?, ?, ?)',
-        [id, label, username, encPass, os, swapKeys]
+        `INSERT OR REPLACE INTO ec2_settings (instance_id, label, protocol, os, swap_keys, ${Object.keys(cols).join(', ')}) VALUES (?, ?, ?, ?, ?, ${Object.keys(cols).map(() => '?').join(', ')})`,
+        [id, label, protocol, os, swapKeys, ...Object.values(cols)]
     );
 }
 
