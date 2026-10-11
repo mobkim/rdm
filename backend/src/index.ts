@@ -284,6 +284,49 @@ const GUACD_ACTIONS = ['start', 'stop', 'restart'];
 // then starts again, so this has to sit comfortably past both.
 const GUACD_ACTION_TIMEOUT_MS = 30000;
 
+// Local control of the RustDesk desktop app, for hosts (this is only
+// meaningful when the backend itself runs on the same Mac being connected to
+// over the RustDesk protocol — e.g. this machine is also a RustDesk target
+// reached from elsewhere via rdm) that want it quit while idle rather than
+// sitting open and listening at all times. `open -a <name>` both launches and
+// focuses the app (a no-op if it's already running, so it's safe to call on
+// every connect attempt); `pkill -x <name>` quits it by exact process name.
+// Blank RUSTDESK_APP_NAME disables this entirely, same as GUACD_SERVICE blank
+// disables guacd control — and it only ever runs on darwin regardless, since
+// `open`/`pkill -x` as used here are macOS-specific.
+const RUSTDESK_APP_NAME = process.env.RUSTDESK_APP_NAME ?? 'RustDesk';
+const RUSTDESK_CONTROLLABLE = process.platform === 'darwin' && !!RUSTDESK_APP_NAME;
+const RUSTDESK_ACTION_TIMEOUT_MS = 10000;
+
+const isRustDeskAppRunning = (): Promise<boolean> => new Promise(resolve => {
+    execFile('pgrep', ['-x', RUSTDESK_APP_NAME], (err) => resolve(!err));
+});
+
+const startRustDeskApp = async (): Promise<string | null> => {
+    try {
+        await execFileAsync('open', ['-a', RUSTDESK_APP_NAME], { timeout: RUSTDESK_ACTION_TIMEOUT_MS });
+        return null;
+    } catch (err: any) {
+        return `Couldn't start ${RUSTDESK_APP_NAME}: ${(err.stderr || err.message || '').toString().trim()}`;
+    }
+};
+
+const stopRustDeskApp = async (): Promise<string | null> => {
+    try {
+        await execFileAsync('pkill', ['-x', RUSTDESK_APP_NAME], { timeout: RUSTDESK_ACTION_TIMEOUT_MS });
+        return null;
+    } catch (err: any) {
+        // pkill exits non-zero (with no stderr) when nothing matched — not a
+        // real failure, the app just wasn't running.
+        if (err.code === 1 && !err.stderr) return null;
+        return `Couldn't stop ${RUSTDESK_APP_NAME}: ${(err.stderr || err.message || '').toString().trim()}`;
+    }
+};
+
+// Last time a RustDesk connection was attempted via /api/connect — mirrors
+// lastGuacdUseAt, driving the same 12h-idle auto-stop for the local app.
+let lastRustDeskUseAt = Date.now();
+
 const guacdStatus = (probe: { reachable: boolean; error?: string }) => ({
     reachable: probe.reachable,
     host: GUACD_HOST,
@@ -300,28 +343,43 @@ app.get('/api/guacd', async (req, res) => {
     res.json(guacdStatus(await probeGuacd()));
 });
 
+// Shared by the manual Start/Stop/Restart buttons (below) and the automatic
+// 12h-idle-stop / connect-time-auto-start logic (see lastGuacdUseAt and its
+// use in /api/connect and the idle-check interval further down). Returns an
+// error string on failure instead of throwing/responding itself, so each
+// caller can report it their own way (an HTTP response here, a log line there).
+const runGuacdServiceAction = async (action: string): Promise<string | null> => {
+    if (!GUACD_SERVICE) return 'guacd service control is disabled on this host (GUACD_SERVICE is unset).';
+    const [cmd, ...prefixArgs] = GUACD_SERVICE_CMD.split(/\s+/).filter(Boolean);
+    if (!cmd) return 'guacd service control is misconfigured (GUACD_SERVICE_CMD is empty).';
+    try {
+        await execFileAsync(cmd, [...prefixArgs, action, GUACD_SERVICE], { timeout: GUACD_ACTION_TIMEOUT_MS });
+        return null;
+    } catch (err: any) {
+        // stderr is where the useful part lives — a missing sudoers rule, an
+        // unknown unit — so pass it through rather than a generic failure.
+        const detail = (err.stderr || err.message || '').toString().trim();
+        return `Couldn't ${action} ${GUACD_SERVICE}: ${detail}`;
+    }
+};
+
+// Last time an RDP/VNC connection was attempted via /api/connect — i.e. the
+// last time guacd was actually needed, not merely reachable. Drives the
+// 12h-idle auto-stop below; "started" in that feature's description means
+// this, not guacd's own process-start time.
+let lastGuacdUseAt = Date.now();
+
 app.post('/api/guacd/:action', async (req, res) => {
     const { action } = req.params;
     if (!GUACD_ACTIONS.includes(action)) {
         return res.status(400).json({ error: `Unsupported action '${action}'` });
     }
-    if (!GUACD_SERVICE) {
-        return res.status(501).json({ error: 'guacd service control is disabled on this host (GUACD_SERVICE is unset).' });
+    const error = await runGuacdServiceAction(action);
+    if (error) {
+        console.error(`Error running '${action}' on ${GUACD_SERVICE}:`, error);
+        return res.status(GUACD_SERVICE ? 500 : 501).json({ error });
     }
-
-    const [cmd, ...prefixArgs] = GUACD_SERVICE_CMD.split(/\s+/).filter(Boolean);
-    if (!cmd) {
-        return res.status(501).json({ error: 'guacd service control is misconfigured (GUACD_SERVICE_CMD is empty).' });
-    }
-    try {
-        await execFileAsync(cmd, [...prefixArgs, action, GUACD_SERVICE], { timeout: GUACD_ACTION_TIMEOUT_MS });
-    } catch (err: any) {
-        // stderr is where the useful part lives — a missing sudoers rule, an
-        // unknown unit — so pass it through rather than a generic failure.
-        const detail = (err.stderr || err.message || '').toString().trim();
-        console.error(`Error running '${action}' on ${GUACD_SERVICE}:`, detail);
-        return res.status(500).json({ error: `Couldn't ${action} ${GUACD_SERVICE}: ${detail}` });
-    }
+    if (action !== 'stop') lastGuacdUseAt = Date.now();
 
     const probe = await waitForGuacd(action !== 'stop');
     res.json({ ...guacdStatus(probe), action });
@@ -498,16 +556,37 @@ app.post('/api/connect', async (req, res) => {
                 // a RustDesk permanent password set on the target machine.
                 password = ec2Setting?.password || '';
             }
+            lastRustDeskUseAt = Date.now();
+            // Launch (or just focus, if it's already running) the local app
+            // before handing back a session — see RUSTDESK_CONTROLLABLE. Only
+            // meaningful when this backend runs on the same Mac being
+            // connected to; a no-op everywhere else.
+            if (RUSTDESK_CONTROLLABLE && !(await isRustDeskAppRunning())) {
+                const error = await startRustDeskApp();
+                if (error) console.error(error);
+                // Give it a moment to actually bind its listening port before
+                // the client connects — launching the app isn't instant.
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            }
             const sessionId = createRustDeskSession({ host, password });
             return res.json({ sessionId, instanceId: instanceId || customId, protocol: 'rustdesk' });
         }
 
         // Checked before any of the work below, so a stopped guacd is reported as
         // itself instead of as a session that opens and instantly vanishes.
-        const probe = await probeGuacd();
+        let probe = await probeGuacd();
+        if (!probe.reachable && GUACD_SERVICE) {
+            // guacd may simply have been auto-stopped after 12h idle (see the
+            // idle-check interval below) — bring it back up on demand rather
+            // than making the user do it from Settings.
+            const error = await runGuacdServiceAction('start');
+            if (error) console.error(error);
+            probe = await waitForGuacd(true);
+        }
         if (!probe.reachable) {
             return res.status(503).json({ error: guacdUnreachableMessage(probe.error) });
         }
+        lastGuacdUseAt = Date.now();
 
         let rdpHostname = '';
         let rdpPort = protocol === 'vnc' ? 5900 : 3389;
@@ -1013,6 +1092,36 @@ app.use(express.static(FRONTEND_DIST));
 // Express 5 (path-to-regexp v6+) requires a named wildcard — bare '*' throws
 // at route registration.
 app.get('/*splat', (req, res) => res.sendFile(path.join(FRONTEND_DIST, 'index.html')));
+
+// guacd and the local RustDesk app (see runGuacdServiceAction /
+// startRustDeskApp/stopRustDeskApp above) are each auto-stopped once they've
+// sat unused for this long — "not started within the last 12 hours" means
+// no connection attempt has needed them in that window, tracked by
+// lastGuacdUseAt / lastRustDeskUseAt. Both auto-start again the moment a
+// matching connection is attempted (see /api/connect), so this is purely
+// about not leaving either listening indefinitely between uses.
+const IDLE_STOP_MS = 12 * 60 * 60 * 1000;
+// Only needs to be frequent enough that the actual stop lands within a few
+// minutes of the 12h mark, not on it exactly.
+const IDLE_CHECK_INTERVAL_MS = 15 * 60 * 1000;
+
+setInterval(async () => {
+    if (GUACD_SERVICE && Date.now() - lastGuacdUseAt > IDLE_STOP_MS) {
+        const probe = await probeGuacd();
+        if (probe.reachable) {
+            const error = await runGuacdServiceAction('stop');
+            if (error) console.error('Idle auto-stop:', error);
+            else console.log('guacd auto-stopped after 12h idle');
+        }
+    }
+    if (RUSTDESK_CONTROLLABLE && Date.now() - lastRustDeskUseAt > IDLE_STOP_MS) {
+        if (await isRustDeskAppRunning()) {
+            const error = await stopRustDeskApp();
+            if (error) console.error('Idle auto-stop:', error);
+            else console.log(`${RUSTDESK_APP_NAME} auto-stopped after 12h idle`);
+        }
+    }
+}, IDLE_CHECK_INTERVAL_MS);
 
 const PORT = process.env.PORT || 3001;
 

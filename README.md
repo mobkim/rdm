@@ -77,6 +77,11 @@ Browser (React SPA)  ──WebSocket──►  Backend (Express + guacamole-lite
    Set `GUACD_SERVICE=` (blank) to remove the buttons. The Start/Stop/Restart
    buttons are only reachable once signed in — see [Authentication](#authentication).
 
+   guacd (and, on a Mac where the backend itself is also a RustDesk target,
+   the local RustDesk app) auto-stops after 12h with no connection attempt and
+   auto-starts the moment one comes in — see `RUSTDESK_APP_NAME` in
+   `backend/.env.example`.
+
 3. **Configure the backend**
    ```bash
    cp backend/.env.example backend/.env
