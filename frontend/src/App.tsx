@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useLayoutEffect } from 'react';
-import { Grid, Maximize, Square, PlayCircle, StopCircle, RefreshCw, PanelLeftClose, PanelLeftOpen, Plus, X, ChevronUp, ChevronDown, Settings, SlidersHorizontal, GalleryHorizontalEnd, Loader2, DollarSign, AlertTriangle, ArrowUpDown, GripVertical, Check, Cpu, LogOut, ShieldCheck, ShieldOff } from 'lucide-react';
+import { Grid, Maximize, Square, PlayCircle, StopCircle, RefreshCw, PanelLeftClose, PanelLeftOpen, Plus, X, ChevronUp, ChevronDown, Settings, SlidersHorizontal, GalleryHorizontalEnd, Loader2, DollarSign, AlertTriangle, ArrowUpDown, GripVertical, Check, Cpu, LogOut, ShieldCheck, ShieldOff, Link2, Unlink2 } from 'lucide-react';
 import { GuacamoleClient } from './GuacamoleClient';
 import { RustDeskClient } from './RustDeskClient';
 import { useDeviceClipboard } from './deviceClipboard';
@@ -1820,12 +1820,10 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         // reconnect 2 → reappears between 1 and 3.
     }, []);
 
-    const connectAll = async () => {
-        for (const inst of instances) {
-            if (inst.state === 'running' && !activeSessions[inst.id]) {
-                await connectInstance(inst.id);
-            }
-        }
+    // Connect/disconnect-all is per-section (custom "Active Instances" vs AWS
+    // EC2) rather than one global action — each section gets its own pair of
+    // icon buttons instead of sharing header-level ones.
+    const connectAllCustom = async () => {
         for (const custom of customInstances) {
             if (!activeSessions[custom.id]) {
                 await connectInstance(custom.id);
@@ -1833,10 +1831,28 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         }
     };
 
-    const disconnectAll = () => {
-        // Clear active sessions but keep the remembered order, so reconnecting
-        // any of them restores its previous slot.
-        setActiveSessions({});
+    const disconnectAllCustom = () => {
+        setActiveSessions(prev => {
+            const next = { ...prev };
+            for (const custom of customInstances) delete next[custom.id];
+            return next;
+        });
+    };
+
+    const connectAllEc2 = async () => {
+        for (const inst of instances) {
+            if (inst.state === 'running' && !activeSessions[inst.id]) {
+                await connectInstance(inst.id);
+            }
+        }
+    };
+
+    const disconnectAllEc2 = () => {
+        setActiveSessions(prev => {
+            const next = { ...prev };
+            for (const inst of instances) delete next[inst.id];
+            return next;
+        });
     };
 
     // Move `fromId` to occupy `toId`'s slot in the grid order.
@@ -2098,20 +2114,6 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                     <h1 className="text-2xl font-bold bg-gradient-to-r from-blue-400 to-indigo-500 bg-clip-text text-transparent">
                         RDm
                     </h1>
-                    <button
-                        onClick={connectAll}
-                        disabled={loading || instances.length === 0}
-                        className="text-sm bg-blue-600/20 text-blue-400 hover:bg-blue-600/30 border border-blue-500/30 px-3 py-1.5 rounded flex items-center gap-2 transition-colors disabled:opacity-50"
-                    >
-                        Connect All
-                    </button>
-                    <button
-                        onClick={disconnectAll}
-                        disabled={activeSessionList.length === 0}
-                        className="text-sm bg-orange-600/20 text-orange-400 hover:bg-orange-600/30 border border-orange-500/30 px-3 py-1.5 rounded flex items-center gap-2 transition-colors disabled:opacity-50"
-                    >
-                        Disconnect All
-                    </button>
                 </div>
 
                 <div className="flex items-center gap-2 bg-slate-800 p-1 rounded-lg border border-slate-700">
@@ -2212,13 +2214,31 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                     <aside className="w-64 bg-slate-900 border-r border-slate-800 flex flex-col overflow-y-auto shrink-0">
                         <div className="p-4 border-b border-slate-800 flex justify-between items-center">
                             <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Active Instances</h2>
-                            <button
-                                onClick={openAddModal}
-                                className="text-slate-400 hover:text-white p-1 bg-slate-800 rounded hover:bg-slate-700 transition-colors"
-                                title="Add Custom RDP"
-                            >
-                                <Plus size={14} />
-                            </button>
+                            <div className="flex items-center gap-1">
+                                <button
+                                    onClick={connectAllCustom}
+                                    disabled={customInstances.length === 0 || customInstances.every(c => activeSessions[c.id])}
+                                    title="Connect all"
+                                    className="p-1 rounded text-blue-400 hover:bg-blue-500/20 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                                >
+                                    <Link2 size={14} />
+                                </button>
+                                <button
+                                    onClick={disconnectAllCustom}
+                                    disabled={!customInstances.some(c => activeSessions[c.id])}
+                                    title="Disconnect all"
+                                    className="p-1 rounded text-orange-400 hover:bg-orange-500/20 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                                >
+                                    <Unlink2 size={14} />
+                                </button>
+                                <button
+                                    onClick={openAddModal}
+                                    className="text-slate-400 hover:text-white p-1 bg-slate-800 rounded hover:bg-slate-700 transition-colors"
+                                    title="Add Custom RDP"
+                                >
+                                    <Plus size={14} />
+                                </button>
+                            </div>
                         </div>
                     {error && <div className="p-4 text-red-400 text-sm">{error}</div>}
                     <ul className="flex-1 p-2 space-y-1">
@@ -2297,6 +2317,22 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                         className="p-1 rounded text-red-400 hover:bg-red-500/20 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
                                     >
                                         <StopCircle size={16} />
+                                    </button>
+                                    <button
+                                        onClick={connectAllEc2}
+                                        disabled={instances.every(i => i.state !== 'running' || activeSessions[i.id])}
+                                        title="Connect all"
+                                        className="p-1 rounded text-blue-400 hover:bg-blue-500/20 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                                    >
+                                        <Link2 size={16} />
+                                    </button>
+                                    <button
+                                        onClick={disconnectAllEc2}
+                                        disabled={!instances.some(i => activeSessions[i.id])}
+                                        title="Disconnect all"
+                                        className="p-1 rounded text-orange-400 hover:bg-orange-500/20 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                                    >
+                                        <Unlink2 size={16} />
                                     </button>
                                 </div>
                             </div>
