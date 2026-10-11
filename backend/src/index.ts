@@ -233,20 +233,25 @@ const guacClientOptions = {
     port: GUACD_PORT
 };
 
-// Opens and immediately drops a TCP connection to guacd. Enough to tell "not
-// running / not reachable" from "running but the RDP target is refusing us",
-// which are otherwise indistinguishable once the tunnel has been handed off.
-const probeGuacd = () => new Promise<{ reachable: boolean; error?: string }>(resolve => {
-    const socket = net.createConnection({ host: GUACD_HOST, port: GUACD_PORT });
+// Opens and immediately drops a TCP connection to `host:port`. Enough to tell
+// "not running / not reachable" from "running but the target is refusing us",
+// which are otherwise indistinguishable once a tunnel has been handed off.
+// Shared by the guacd probe below and the per-instance reachability ping
+// (/api/ping) — neither attempts to actually authenticate, just confirms the
+// port accepts a connection.
+const probeTcp = (host: string, port: number, timeoutMs: number) => new Promise<{ reachable: boolean; error?: string }>(resolve => {
+    const socket = net.createConnection({ host, port });
     const settle = (result: { reachable: boolean; error?: string }) => {
         socket.destroy();
         resolve(result);
     };
-    socket.setTimeout(GUACD_PROBE_TIMEOUT_MS);
+    socket.setTimeout(timeoutMs);
     socket.once('connect', () => settle({ reachable: true }));
-    socket.once('timeout', () => settle({ reachable: false, error: `no response within ${GUACD_PROBE_TIMEOUT_MS}ms` }));
+    socket.once('timeout', () => settle({ reachable: false, error: `no response within ${timeoutMs}ms` }));
     socket.once('error', (err: NodeJS.ErrnoException) => settle({ reachable: false, error: err.code || err.message }));
 });
+
+const probeGuacd = () => probeTcp(GUACD_HOST, GUACD_PORT, GUACD_PROBE_TIMEOUT_MS);
 
 const guacdUnreachableMessage = (error?: string) =>
     `guacd is unreachable at ${GUACD_HOST}:${GUACD_PORT}${error ? ` (${error})` : ''} — check that the guacd service is running.`;
@@ -637,6 +642,34 @@ app.post('/api/connect', async (req, res) => {
         res.json({ token, instanceId: instanceId || customId, port: rdpPort });
     } catch (err: any) {
         console.error('Error connecting:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+const PING_TIMEOUT_MS = 4000;
+const PROTOCOL_PORTS: Record<string, number> = { rdp: 3389, vnc: 5900, rustdesk: 21118 };
+
+// Reachability check for an already-connected custom instance's sidebar
+// status dot, called by the frontend when it first becomes active — a fresh
+// connect, or a page load/refresh restoring one (see App.tsx). EC2 instances
+// don't use this — their dot already reflects AWS's own on-demand power
+// state. Deliberately TCP-only — just "is the port open" — not an
+// authenticated login: a real handshake would mean a different
+// implementation per protocol (RDP NLA, VNC auth, RustDesk's own login).
+app.post('/api/ping', async (req, res) => {
+    try {
+        const { customId } = req.body;
+        if (!customId) return res.status(400).json({ error: 'Missing customId' });
+        const custom = await getCustomInstance(customId);
+        if (!custom) return res.status(404).json({ error: 'Custom instance not found' });
+        const host = custom.ip;
+        if (!host) return res.json({ reachable: false, error: 'Instance has no IP address' });
+
+        const port = PROTOCOL_PORTS[custom.protocol || 'rdp'] ?? 3389;
+        const probe = await probeTcp(host, port, PING_TIMEOUT_MS);
+        res.json({ reachable: probe.reachable, error: probe.error ? `${host}:${port} — ${probe.error}` : undefined });
+    } catch (err: any) {
+        console.error('Error pinging instance:', err);
         res.status(500).json({ error: err.message });
     }
 });
