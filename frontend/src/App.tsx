@@ -685,6 +685,16 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
     // size (1 = auto-fit, unchanged from before this existed). Adjustable via
     // the popup slider shown when the Grid button is clicked.
     const [fillZoom, setFillZoom] = useState(1);
+    // The actual pixel tile width the slider last asked for (zoom *
+    // autoFillLayout.tileW at the moment it was dragged), so that width can
+    // be preserved — rather than the dimensionless zoom ratio — across
+    // whatever changes autoFillLayout's own auto-fit base tile size (most
+    // commonly connecting/disconnecting a session, which re-packs the grid at
+    // a different base size). Preserving the ratio instead of the pixel size
+    // was what made opening another session visibly "reset" a manually-picked
+    // scale: the same ratio against a smaller auto-fit base renders smaller.
+    // null means "never manually zoomed" — stay at the auto-fit default (1).
+    const targetTileWRef = useRef<number | null>(null);
     const [showFillZoomSlider, setShowFillZoomSlider] = useState(false);
     // Hide the zoom popup the instant the user leaves Grid for another
     // layout — it otherwise only closed on the popup's own onMouseLeave,
@@ -702,9 +712,6 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
     useEffect(() => {
         if (gridLayout !== 1 && gridLayout !== 3) setShowSessionPicker(false);
     }, [gridLayout]);
-    // Last render's zoom bounds, so the pin-to-edge effect below can tell
-    // whether fillZoom was sitting at the old min/max (see that effect).
-    const fillZoomBoundsPrev = useRef<{ min: number; max: number }>({ min: 0.5, max: 1.3 });
     // Single-clicking a pane's header "maximizes" it to fill the whole main
     // content area in-page, on top of whatever grid layout is active — the
     // other panes stay mounted (just hidden) so their sessions don't drop.
@@ -1969,23 +1976,24 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
     const fillZoomBoundsVal = autoFillLayout
         ? fillZoomBounds(autoFillLayout, fillContainerSize.w, GRID_GAP, orderedSessions.length)
         : { min: 0.5, max: 1.3 };
-    // fillZoomBoundsVal is recomputed from live container/session state, so it
-    // shifts as the window resizes, the sidebar toggles, or sessions
-    // connect/disconnect. Without this, dragging the slider to its right edge
-    // (fillZoom = that render's max) would visibly fall short of the new
-    // right edge the next time bounds shrink the *other* direction — the
-    // thumb stays at the old absolute value while the track's max moves out
-    // from under it. Keep it pinned to whichever edge (or clamped into range)
-    // it was on last render instead of drifting.
+    // autoFillLayout.tileW (the auto-fit base) shifts as the window resizes,
+    // the sidebar toggles, or — most commonly — a session connects or
+    // disconnects and the grid re-packs at a different base size. fillZoom is
+    // a ratio on top of that base, so re-deriving it from the *pixel* tile
+    // width the slider last asked for (targetTileWRef), rather than carrying
+    // the ratio forward unchanged, keeps a manually-picked scale looking the
+    // same size on screen across those changes instead of visibly snapping
+    // smaller/larger whenever the base does. Never manually zoomed
+    // (targetTileWRef still null) just means "stay at the auto-fit default",
+    // clamped into whatever the current bounds are.
     useEffect(() => {
-        const prev = fillZoomBoundsPrev.current;
-        fillZoomBoundsPrev.current = fillZoomBoundsVal;
+        if (!autoFillLayout) return;
         setFillZoom(z => {
-            if (z >= prev.max - 1e-6) return fillZoomBoundsVal.max;
-            if (z <= prev.min + 1e-6) return fillZoomBoundsVal.min;
-            return Math.min(fillZoomBoundsVal.max, Math.max(fillZoomBoundsVal.min, z));
+            const targetW = targetTileWRef.current;
+            const desired = targetW !== null ? targetW / autoFillLayout.tileW : z;
+            return Math.min(fillZoomBoundsVal.max, Math.max(fillZoomBoundsVal.min, desired));
         });
-    }, [fillZoomBoundsVal.min, fillZoomBoundsVal.max]);
+    }, [autoFillLayout?.tileW, fillZoomBoundsVal.min, fillZoomBoundsVal.max]);
 
     const renderSessionTile = (session: ActiveSession) => {
         // Resolve name/IP from the live instance lists so a session restored
@@ -2144,7 +2152,11 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                     // short of the right edge. `any` lets it reach the exact min/max.
                                     step="any"
                                     value={fillZoom}
-                                    onChange={(e) => setFillZoom(Number(e.target.value))}
+                                    onChange={(e) => {
+                                        const z = Number(e.target.value);
+                                        if (autoFillLayout) targetTileWRef.current = z * autoFillLayout.tileW;
+                                        setFillZoom(z);
+                                    }}
                                     className="w-32 accent-blue-500"
                                 />
                             </div>
