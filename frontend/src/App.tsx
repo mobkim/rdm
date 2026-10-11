@@ -1923,6 +1923,15 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
     // Force the sidebar open whenever nothing is in view, regardless of the
     // stored preference; falls back to that preference once a session exists.
     const isSidebarVisible = sidebarPref || activeSessionList.length === 0;
+    // Keep the stored preference in sync while the sidebar is only showing
+    // because of that force-open override — otherwise a stale `false`
+    // preference (left over from before every session disconnected) would
+    // silently take over and close the sidebar the instant the very next
+    // connection succeeds, reading as an unprompted autoclose rather than
+    // something the user actually asked for.
+    useEffect(() => {
+        if (activeSessionList.length === 0 && !sidebarPref) setSidebarPref(true);
+    }, [activeSessionList.length, sidebarPref]);
     // Render in explicit drag order; ignore ids no longer connected.
     const orderedSessions = sessionOrder.map(id => activeSessions[id]).filter(Boolean) as ActiveSession[];
     // Name for the session-picker strip's tooltips — resolved the same way
@@ -2352,7 +2361,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                 </aside>
                 )}
 
-                {isSidebarVisible && (
+                {isSidebarVisible && activeSessionList.length > 0 && (
                     <button
                         onClick={() => setSidebarPref(false)}
                         className="fixed top-1/2 left-64 -translate-y-1/2 bg-slate-800 text-slate-400 hover:text-white w-5 py-6 rounded-r-lg border-r border-y border-slate-700 shadow-md z-20 opacity-40 hover:opacity-100 hover:z-50 transition-opacity flex items-center justify-center"
