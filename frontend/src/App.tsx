@@ -1824,10 +1824,10 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         // reconnect 2 → reappears between 1 and 3.
     }, []);
 
-    // TCP-reachability check for one active *custom* instance's sidebar status
-    // dot — see the `reachability` state and the effect below. EC2 instances
-    // don't need this: their dot already reflects the on-demand AWS power
-    // state (running/stopped), which is a far more direct signal than a
+    // TCP-reachability check for one *custom* instance's sidebar status dot —
+    // see the `reachability` state and the effect below. EC2 instances don't
+    // need this: their dot already reflects the on-demand AWS power state
+    // (running/stopped), which is a far more direct signal than a
     // reachability probe.
     const pingInstance = useCallback(async (instanceId: string) => {
         try {
@@ -1843,23 +1843,20 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         }
     }, []);
 
-    // Check reachability the moment each custom instance first becomes
-    // active — which covers both a fresh connect and a page load/refresh
-    // restoring an already-active session, since pingedRef starts out empty
-    // on every mount.
+    // Check reachability of every custom instance once, the moment it first
+    // shows up in the sidebar — which is on page load/refresh for whatever's
+    // already saved, and immediately for one just added. pingedRef starts out
+    // empty on every mount, so a refresh always re-checks all of them rather
+    // than relying on a stale result from before the reload.
     const pingedRef = useRef<Set<string>>(new Set());
     useEffect(() => {
-        const activeCustomIds = Object.keys(activeSessions).filter(id => customInstances.some(c => c.id === id));
-        for (const id of activeCustomIds) {
-            if (!pingedRef.current.has(id)) {
-                pingedRef.current.add(id);
-                pingInstance(id);
+        for (const inst of customInstances) {
+            if (!pingedRef.current.has(inst.id)) {
+                pingedRef.current.add(inst.id);
+                pingInstance(inst.id);
             }
         }
-        for (const id of Array.from(pingedRef.current)) {
-            if (!activeSessions[id]) pingedRef.current.delete(id);
-        }
-    }, [activeSessions, customInstances, pingInstance]);
+    }, [customInstances, pingInstance]);
 
     // Connect/disconnect-all is per-section (custom "Active Instances" vs AWS
     // EC2) rather than one global action — each section gets its own pair of
@@ -2286,7 +2283,17 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                         {customInstances.map(inst => {
                             const isConnected = !!activeSessions[inst.id];
                             const reach = reachability[inst.id];
-                            const isUnreachable = isConnected && reach?.reachable === false;
+                            // Connected always reads as reachable (you're actively
+                            // using it) regardless of what the last ping said — a
+                            // live session is a stronger signal than a TCP probe.
+                            // Otherwise: red once a ping has come back unreachable,
+                            // blue once one's come back reachable, and the original
+                            // indigo while still waiting on that first ping.
+                            const isUnreachable = !isConnected && reach?.reachable === false;
+                            const dotClass = isConnected ? 'bg-green-500'
+                                : reach?.reachable === false ? 'bg-red-500'
+                                : reach?.reachable === true ? 'bg-blue-400'
+                                : 'bg-indigo-400';
                             return (
                                 <li key={inst.id} className={`w-full text-left px-3 py-2 rounded flex flex-col gap-2 group transition-colors ${
                                     isConnected ? 'bg-indigo-600/10 border border-indigo-500/20' : 'hover:bg-slate-800 border border-transparent'
@@ -2295,7 +2302,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                         <div className="flex flex-col truncate">
                                             <div className="flex items-center gap-2">
                                                 <span
-                                                    className={`w-2 h-2 rounded-full ${isConnected ? (isUnreachable ? 'bg-red-500' : 'bg-green-500') : 'bg-indigo-400'}`}
+                                                    className={`w-2 h-2 rounded-full ${dotClass}`}
                                                     title={isUnreachable ? `Unreachable: ${reach?.error || 'unknown reason'}` : undefined}
                                                 ></span>
                                                 <span className={`font-medium text-sm truncate ${isConnected ? 'text-indigo-400' : 'text-slate-300'}`}>{inst.name}</span>
