@@ -284,18 +284,37 @@ const GUACD_ACTIONS = ['start', 'stop', 'restart'];
 // then starts again, so this has to sit comfortably past both.
 const GUACD_ACTION_TIMEOUT_MS = 30000;
 
-// Local control of the RustDesk desktop app, for hosts (this is only
-// meaningful when the backend itself runs on the same Mac being connected to
-// over the RustDesk protocol — e.g. this machine is also a RustDesk target
-// reached from elsewhere via rdm) that want it quit while idle rather than
-// sitting open and listening at all times. `open -a <name>` both launches and
-// focuses the app (a no-op if it's already running, so it's safe to call on
-// every connect attempt); `pkill -x <name>` quits it by exact process name.
+// Local control of RustDesk's actual listening process, for hosts (this is
+// only meaningful when the backend itself runs on the same Mac being
+// connected to over the RustDesk protocol — e.g. this machine is also a
+// RustDesk target reached from elsewhere via rdm) that want it down while
+// idle rather than sitting open and listening at all times.
+//
+// A plain `pkill` doesn't work here: RustDesk installs its own launchd
+// supervisor for the process that actually binds the Direct IP Access port
+// (`com.carriez.RustDesk_server`, a LaunchAgent with `KeepAlive: { Success-
+// fulExit: false }`) — killing the process just gets it relaunched within
+// about a second. Durably stopping it means unloading that supervisor too
+// (`launchctl bootout`); starting it again means reloading it (`launchctl
+// bootstrap`, which re-launches immediately per the agent's own RunAtLoad).
+// Confirmed against this project's actual Mac host: `bootout` drops the
+// process and frees the port with no respawn, `bootstrap` brings it straight
+// back up. Both are plain per-user `gui/<uid>` launchctl calls — the agent is
+// defined in /Library/LaunchAgents but (per its LimitLoadToSessionType)
+// loaded into the logged-in user's own session, not root's, so no sudo is
+// needed despite the file being root-owned.
+//
+// (RustDesk's *other* launchd job, com.carriez.RustDesk_service — a true
+// root LaunchDaemon — runs a differently-named "service" binary and isn't
+// involved in Direct IP Access at all; deliberately left alone.)
+//
 // Blank RUSTDESK_APP_NAME disables this entirely, same as GUACD_SERVICE blank
-// disables guacd control — and it only ever runs on darwin regardless, since
-// `open`/`pkill -x` as used here are macOS-specific.
+// disables guacd control — and it only ever runs on darwin regardless.
 const RUSTDESK_APP_NAME = process.env.RUSTDESK_APP_NAME ?? 'RustDesk';
 const RUSTDESK_CONTROLLABLE = process.platform === 'darwin' && !!RUSTDESK_APP_NAME;
+const RUSTDESK_LAUNCHD_LABEL = process.env.RUSTDESK_LAUNCHD_LABEL || 'com.carriez.RustDesk_server';
+const RUSTDESK_LAUNCHD_PLIST = process.env.RUSTDESK_LAUNCHD_PLIST || '/Library/LaunchAgents/com.carriez.RustDesk_server.plist';
+const RUSTDESK_LAUNCHD_DOMAIN = `gui/${process.getuid ? process.getuid() : ''}`;
 const RUSTDESK_ACTION_TIMEOUT_MS = 10000;
 
 const isRustDeskAppRunning = (): Promise<boolean> => new Promise(resolve => {
@@ -304,28 +323,43 @@ const isRustDeskAppRunning = (): Promise<boolean> => new Promise(resolve => {
 
 const startRustDeskApp = async (): Promise<string | null> => {
     try {
-        await execFileAsync('open', ['-a', RUSTDESK_APP_NAME], { timeout: RUSTDESK_ACTION_TIMEOUT_MS });
+        await execFileAsync('launchctl', ['bootstrap', RUSTDESK_LAUNCHD_DOMAIN, RUSTDESK_LAUNCHD_PLIST], { timeout: RUSTDESK_ACTION_TIMEOUT_MS });
         return null;
     } catch (err: any) {
-        return `Couldn't start ${RUSTDESK_APP_NAME}: ${(err.stderr || err.message || '').toString().trim()}`;
+        const detail = (err.stderr || err.message || '').toString().trim();
+        // Exit 5 ("Bootstrap failed: 5: Input/output error") is launchctl's
+        // way of saying the job is already loaded — not a real failure.
+        if (err.code === 5) return null;
+        return `Couldn't start RustDesk (bootstrap ${RUSTDESK_LAUNCHD_LABEL}): ${detail}`;
     }
 };
 
 const stopRustDeskApp = async (): Promise<string | null> => {
     try {
-        await execFileAsync('pkill', ['-x', RUSTDESK_APP_NAME], { timeout: RUSTDESK_ACTION_TIMEOUT_MS });
+        await execFileAsync('launchctl', ['bootout', `${RUSTDESK_LAUNCHD_DOMAIN}/${RUSTDESK_LAUNCHD_LABEL}`], { timeout: RUSTDESK_ACTION_TIMEOUT_MS });
         return null;
     } catch (err: any) {
-        // pkill exits non-zero (with no stderr) when nothing matched — not a
-        // real failure, the app just wasn't running.
-        if (err.code === 1 && !err.stderr) return null;
-        return `Couldn't stop ${RUSTDESK_APP_NAME}: ${(err.stderr || err.message || '').toString().trim()}`;
+        // bootout on an already-unloaded job also exits 0 (confirmed against
+        // this host) — so a thrown error here is a genuine failure.
+        return `Couldn't stop RustDesk (bootout ${RUSTDESK_LAUNCHD_LABEL}): ${(err.stderr || err.message || '').toString().trim()}`;
     }
 };
 
 // Last time a RustDesk connection was attempted via /api/connect — mirrors
 // lastGuacdUseAt, driving the same 12h-idle auto-stop for the local app.
 let lastRustDeskUseAt = Date.now();
+
+// Live view of the auto-start/auto-stop machinery (see /api/connect and the
+// idle-check interval further down) — 'idle' the rest of the time. Polled by
+// the frontend (GET /api/automation-status) to show a tooltip while either
+// one is actually in flight, rather than only reporting the before/after
+// reachable state the way /api/guacd does.
+type AutomationState = 'idle' | 'starting' | 'stopping';
+const automationStatus: { guacd: AutomationState; rustdesk: AutomationState } = { guacd: 'idle', rustdesk: 'idle' };
+
+app.get('/api/automation-status', (req, res) => {
+    res.json(automationStatus);
+});
 
 const guacdStatus = (probe: { reachable: boolean; error?: string }) => ({
     reachable: probe.reachable,
@@ -562,11 +596,16 @@ app.post('/api/connect', async (req, res) => {
             // meaningful when this backend runs on the same Mac being
             // connected to; a no-op everywhere else.
             if (RUSTDESK_CONTROLLABLE && !(await isRustDeskAppRunning())) {
-                const error = await startRustDeskApp();
-                if (error) console.error(error);
-                // Give it a moment to actually bind its listening port before
-                // the client connects — launching the app isn't instant.
-                await new Promise(resolve => setTimeout(resolve, 2000));
+                automationStatus.rustdesk = 'starting';
+                try {
+                    const error = await startRustDeskApp();
+                    if (error) console.error(error);
+                    // Give it a moment to actually bind its listening port
+                    // before the client connects — launching isn't instant.
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                } finally {
+                    automationStatus.rustdesk = 'idle';
+                }
             }
             const sessionId = createRustDeskSession({ host, password });
             return res.json({ sessionId, instanceId: instanceId || customId, protocol: 'rustdesk' });
@@ -579,9 +618,14 @@ app.post('/api/connect', async (req, res) => {
             // guacd may simply have been auto-stopped after 12h idle (see the
             // idle-check interval below) — bring it back up on demand rather
             // than making the user do it from Settings.
-            const error = await runGuacdServiceAction('start');
-            if (error) console.error(error);
-            probe = await waitForGuacd(true);
+            automationStatus.guacd = 'starting';
+            try {
+                const error = await runGuacdServiceAction('start');
+                if (error) console.error(error);
+                probe = await waitForGuacd(true);
+            } finally {
+                automationStatus.guacd = 'idle';
+            }
         }
         if (!probe.reachable) {
             return res.status(503).json({ error: guacdUnreachableMessage(probe.error) });
@@ -728,11 +772,11 @@ app.post('/api/connect', async (req, res) => {
 const PING_TIMEOUT_MS = 4000;
 const PROTOCOL_PORTS: Record<string, number> = { rdp: 3389, vnc: 5900, rustdesk: 21118 };
 
-// Reachability check for an already-connected custom instance's sidebar
-// status dot, called by the frontend when it first becomes active — a fresh
-// connect, or a page load/refresh restoring one (see App.tsx). EC2 instances
-// don't use this — their dot already reflects AWS's own on-demand power
-// state. Deliberately TCP-only — just "is the port open" — not an
+// Reachability check for a custom instance's sidebar status dot, called by
+// the frontend once per instance on page load/refresh (see App.tsx) — dot is
+// red/blue off that result, green instead once actually connected. EC2
+// instances don't use this — their dot already reflects AWS's own on-demand
+// power state. Deliberately TCP-only — just "is the port open" — not an
 // authenticated login: a real handshake would mean a different
 // implementation per protocol (RDP NLA, VNC auth, RustDesk's own login).
 app.post('/api/ping', async (req, res) => {
@@ -1109,16 +1153,26 @@ setInterval(async () => {
     if (GUACD_SERVICE && Date.now() - lastGuacdUseAt > IDLE_STOP_MS) {
         const probe = await probeGuacd();
         if (probe.reachable) {
-            const error = await runGuacdServiceAction('stop');
-            if (error) console.error('Idle auto-stop:', error);
-            else console.log('guacd auto-stopped after 12h idle');
+            automationStatus.guacd = 'stopping';
+            try {
+                const error = await runGuacdServiceAction('stop');
+                if (error) console.error('Idle auto-stop:', error);
+                else console.log('guacd auto-stopped after 12h idle');
+            } finally {
+                automationStatus.guacd = 'idle';
+            }
         }
     }
     if (RUSTDESK_CONTROLLABLE && Date.now() - lastRustDeskUseAt > IDLE_STOP_MS) {
         if (await isRustDeskAppRunning()) {
-            const error = await stopRustDeskApp();
-            if (error) console.error('Idle auto-stop:', error);
-            else console.log(`${RUSTDESK_APP_NAME} auto-stopped after 12h idle`);
+            automationStatus.rustdesk = 'stopping';
+            try {
+                const error = await stopRustDeskApp();
+                if (error) console.error('Idle auto-stop:', error);
+                else console.log(`${RUSTDESK_APP_NAME} auto-stopped after 12h idle`);
+            } finally {
+                automationStatus.rustdesk = 'idle';
+            }
         }
     }
 }, IDLE_CHECK_INTERVAL_MS);

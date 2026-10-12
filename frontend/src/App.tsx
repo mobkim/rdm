@@ -1030,6 +1030,32 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         if (isSettingsModalOpen) fetchGuacd();
     }, [isSettingsModalOpen, fetchGuacd]);
 
+    // Whether the backend's guacd/RustDesk 12h-idle auto-stop or
+    // connect-time auto-start is actually in flight right now (see
+    // /api/automation-status) — 'idle' almost always. Polled continuously
+    // (not just while a modal is open) since a connect attempt can trigger
+    // this at any time, and that's exactly when a user is likely to be
+    // watching a spinner and wondering why it's slow.
+    const [automationStatus, setAutomationStatus] = useState<{ guacd: 'idle' | 'starting' | 'stopping'; rustdesk: 'idle' | 'starting' | 'stopping' }>({ guacd: 'idle', rustdesk: 'idle' });
+    useEffect(() => {
+        let cancelled = false;
+        const poll = async () => {
+            try {
+                const res = await fetch(`${API_BASE}/automation-status`);
+                if (res.ok && !cancelled) setAutomationStatus(await res.json());
+            } catch {
+                // Transient — next poll will catch up.
+            }
+        };
+        poll();
+        const interval = setInterval(poll, 3000);
+        return () => { cancelled = true; clearInterval(interval); };
+    }, []);
+    const automationNotes = [
+        automationStatus.guacd !== 'idle' && `guacd is ${automationStatus.guacd}…`,
+        automationStatus.rustdesk !== 'idle' && `RustDesk is ${automationStatus.rustdesk}…`
+    ].filter(Boolean) as string[];
+
     // Security section (Settings modal) — password change, optional TOTP 2FA,
     // and the inactivity auto-logout threshold. The session itself is owned
     // by AuthGate (see Auth.tsx); this just triggers changes and asks it to
@@ -2212,6 +2238,15 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                         <ArrowUpDown size={20} />
                     </button>
                     <div className="w-px h-6 bg-slate-700 mx-1"></div>
+                    {automationNotes.length > 0 && (
+                        <span
+                            className="flex items-center gap-1.5 px-2 py-1 rounded bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs cursor-default"
+                            title={automationNotes.join(' ')}
+                        >
+                            <Loader2 size={12} className="animate-spin" />
+                            {automationNotes.join(' / ')}
+                        </span>
+                    )}
                     <button
                         onClick={() => { setIsSettingsModalOpen(true); fetchBilling(); }}
                         className="p-2 rounded text-slate-400 hover:text-white hover:bg-slate-700/50 transition-colors"
@@ -3205,9 +3240,12 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                     <div className="bg-slate-950 border border-slate-700 rounded p-3">
                                         <div className="flex items-center justify-between">
                                             <div className="flex items-center gap-2">
-                                                <span className={`w-2 h-2 rounded-full ${
-                                                    !ready ? 'bg-slate-500' : guacd.reachable ? 'bg-green-500' : 'bg-red-500'
-                                                }`}></span>
+                                                <span
+                                                    className={`w-2 h-2 rounded-full ${
+                                                        !ready ? 'bg-slate-500' : guacd.reachable ? 'bg-green-500' : 'bg-red-500'
+                                                    } ${automationStatus.guacd !== 'idle' ? 'animate-pulse' : ''}`}
+                                                    title={automationStatus.guacd !== 'idle' ? `Auto-${automationStatus.guacd}…` : undefined}
+                                                ></span>
                                                 <span className="text-sm text-slate-300">guacd service</span>
                                             </div>
                                             <button onClick={fetchGuacd} disabled={busy} className="text-slate-400 hover:text-white p-1 disabled:opacity-30" title="Re-check guacd">
