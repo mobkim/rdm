@@ -1007,9 +1007,16 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
     // already in every session by the time you go to paste it.
     useDeviceClipboard(publishClipboard);
 
+    // Browser-side (WebCodecs) RustDesk decode only when the setting is on AND this
+    // browser actually has VideoDecoder; otherwise the backend's ffmpeg path is used.
+    const connectSettings = () => ({
+        ...globalSettings,
+        rustdeskDecode: globalSettings.rustdeskDecode !== 'server' && typeof VideoDecoder !== 'undefined' ? 'browser' : 'server',
+    });
+
     // Settings Modal State
     const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
-    const [globalSettings, setGlobalSettings] = useState({ fontSmoothing: true, colorDepth: '32', vncLossless: false });
+    const [globalSettings, setGlobalSettings] = useState({ fontSmoothing: true, colorDepth: '32', vncLossless: false, rustdeskQuality: 'quality', rustdeskDecode: 'browser' });
 
     // guacd status + service control, shown in the settings modal.
     const [guacd, setGuacd] = useState<GuacdStatus | null>(null);
@@ -1363,7 +1370,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         setConnecting(prev => ({ ...prev, [instanceId]: true }));
         try {
             const isCustom = instanceId.startsWith('custom-');
-            const body = isCustom ? { customId: instanceId, settings: globalSettings } : { instanceId, settings: globalSettings };
+            const body = isCustom ? { customId: instanceId, settings: connectSettings() } : { instanceId, settings: connectSettings() };
 
             let name = instanceId;
             let ip = '';
@@ -1419,7 +1426,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
         if (!activeSessions[instanceId]) return;
         try {
             const isCustom = instanceId.startsWith('custom-');
-            const body = isCustom ? { customId: instanceId, settings: globalSettings } : { instanceId, settings: globalSettings };
+            const body = isCustom ? { customId: instanceId, settings: connectSettings() } : { instanceId, settings: connectSettings() };
             const res = await fetch(`${API_BASE}/connect`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -3324,6 +3331,37 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                     setGlobalSettings(newSet);
                                     localStorage.setItem('rdm_settings', JSON.stringify(newSet));
                                 }} className="w-4 h-4" />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm text-slate-300 mb-1">RustDesk Quality</label>
+                                <select
+                                    className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500"
+                                    value={globalSettings.rustdeskQuality || 'quality'}
+                                    onChange={e => {
+                                        const newSet = {...globalSettings, rustdeskQuality: e.target.value};
+                                        setGlobalSettings(newSet);
+                                        localStorage.setItem('rdm_settings', JSON.stringify(newSet));
+                                    }}
+                                >
+                                    <option value="quality">Best quality (60 fps)</option>
+                                    <option value="balanced">Balanced (30 fps, max 1920 wide)</option>
+                                    <option value="speed">Fastest (30 fps, max 1280 wide, heavy compression)</option>
+                                </select>
+                                <label className="block text-sm text-slate-300 mt-3 mb-1">RustDesk Video Decoding</label>
+                                <select
+                                    className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-white outline-none focus:border-blue-500"
+                                    value={globalSettings.rustdeskDecode || 'browser'}
+                                    onChange={e => {
+                                        const newSet = {...globalSettings, rustdeskDecode: e.target.value};
+                                        setGlobalSettings(newSet);
+                                        localStorage.setItem('rdm_settings', JSON.stringify(newSet));
+                                    }}
+                                >
+                                    <option value="browser">In browser, hardware accelerated (fast)</option>
+                                    <option value="server">On server via ffmpeg → JPEG (compatible)</option>
+                                </select>
+                                <p className="text-xs text-slate-500 mt-1">Browser decoding sends the compressed stream straight to your browser's GPU decoder — far less bandwidth and latency. Falls back to the server path automatically if your browser lacks WebCodecs. Lower settings shrink the video stream, which helps over slow links. Applies to RustDesk sessions as they connect — reconnect to apply.</p>
                             </div>
 
                             <div className="flex items-center justify-between">

@@ -61,7 +61,7 @@ export class Vp9JpegDecoder extends EventEmitter {
   #headerWritten = false;
   #frameIndex = 0;
 
-  constructor(width: number, height: number) {
+  constructor(width: number, height: number, opts: { jpegQuality?: number; maxWidth?: number } = {}) {
     super();
     this.#proc = spawn('ffmpeg', [
       '-hide_banner',
@@ -80,13 +80,14 @@ export class Vp9JpegDecoder extends EventEmitter {
       '-f', 'ivf',
       '-i', 'pipe:0',
       '-f', 'image2pipe',
+      ...(opts.maxWidth && width > opts.maxWidth ? ['-vf', `scale=${opts.maxWidth}:-2:flags=fast_bilinear`] : []),
       '-vcodec', 'mjpeg',
       // Was bumped to 10 (lower quality) as a preemptive bandwidth mitigation for a
       // hypothesized WireGuard-constrained remote hop — reverted now that the actual
       // lag turned out to be the ffmpeg frame-duplication bug (see buildIvfFrameHeader),
       // not bandwidth. The ws.bufferedAmount backpressure check in sessionManager.ts
       // still exists as a real safety net if a slow link does show up again.
-      '-q:v', '5',
+      '-q:v', String(opts.jpegQuality ?? 5),
       'pipe:1',
     ]);
     this.#proc.stdin.write(buildIvfFileHeader(width, height));

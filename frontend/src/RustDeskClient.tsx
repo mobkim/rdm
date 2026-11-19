@@ -91,6 +91,7 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
     const headerRef = useRef<HTMLDivElement>(null);
     const displayRef = useRef<HTMLDivElement>(null);
     const imgRef = useRef<HTMLImageElement>(null);
+    const canvasRef = useRef<HTMLCanvasElement>(null);
     const cursorImgRef = useRef<HTMLImageElement>(null);
     const cursorCache = useRef<Map<number, { url: string; hotx: number; hoty: number; width: number; height: number }>>(new Map());
     const currentCursorId = useRef<number>(0);
@@ -178,6 +179,7 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
     useEffect(() => {
         if (!displayRef.current) return;
         let cleanedUp = false;
+        let cleanupVideo = () => {};
 
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const mountPath = window.location.pathname.replace(/[^/]*$/, '');
@@ -222,9 +224,75 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
             if (cursorEl.src !== cursor.url) cursorEl.src = cursor.url;
         };
 
+        // WebCodecs hardware decode of the peer's compressed stream (see backend
+        // sessionManager passthrough). Decoded frames are painted on a canvas at
+        // display refresh rate, newest only, so a burst never builds up latency.
+        let decoder: VideoDecoder | null = null;
+        let decoderCodec = 0;
+        let needKey = true;
+        let pendingFrame: VideoFrame | null = null;
+        let rafId = 0;
+        const paint = () => {
+            rafId = 0;
+            const f = pendingFrame;
+            pendingFrame = null;
+            const canvas = canvasRef.current;
+            if (!f) return;
+            if (canvas) {
+                if (canvas.width !== f.displayWidth || canvas.height !== f.displayHeight) {
+                    canvas.width = f.displayWidth;
+                    canvas.height = f.displayHeight;
+                }
+                canvas.style.display = 'block';
+                canvas.getContext('2d')?.drawImage(f, 0, 0);
+            }
+            f.close();
+        };
+        const feedVideo = (bytes: Uint8Array) => {
+            const codec = bytes[0];
+            const key = bytes[1] === 1;
+            if (!decoder || decoder.state === 'closed' || decoderCodec !== codec) {
+                if (decoder && decoder.state !== 'closed') decoder.close();
+                decoderCodec = codec;
+                needKey = true;
+                decoder = new VideoDecoder({
+                    output: (frame) => {
+                        pendingFrame?.close();
+                        pendingFrame = frame;
+                        if (!rafId) rafId = requestAnimationFrame(paint);
+                    },
+                    error: () => { needKey = true; },
+                });
+                decoder.configure(codec === 1
+                    ? { codec: 'vp09.00.10.08', hardwareAcceleration: 'prefer-hardware', optimizeForLatency: true }
+                    : { codec: 'avc1.640034', avc: { format: 'annexb' }, hardwareAcceleration: 'prefer-hardware', optimizeForLatency: true } as VideoDecoderConfig);
+            }
+            if (needKey && !key) return;
+            if (decoder.decodeQueueSize > 8 && !key) return; // falling behind: skip until next keyframe
+            if (decoder.state === 'configured') {
+                needKey = false;
+                decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: performance.now() * 1000, data: bytes.subarray(2) }));
+            }
+        };
+        cleanupVideo = () => {
+            if (rafId) cancelAnimationFrame(rafId);
+            pendingFrame?.close();
+            pendingFrame = null;
+            if (decoder && decoder.state !== 'closed') decoder.close();
+        };
+
         ws.onopen = () => setStatus('Waiting...');
         ws.onmessage = (ev) => {
             if (ev.data instanceof ArrayBuffer) {
+                const bytes = new Uint8Array(ev.data);
+                // JPEG frames (ffmpeg path) start 0xFF; passthrough video starts with a
+                // codec byte (1=vp9, 2=h264), then a key flag, then the raw frame.
+                if (bytes[0] === 1 || bytes[0] === 2) {
+                    feedVideo(bytes);
+                    if (!wasConnected.current) { wasConnected.current = true; setStatus('Connected'); }
+                    positionCursor();
+                    return;
+                }
                 const blob = new Blob([ev.data], { type: 'image/jpeg' });
                 const url = URL.createObjectURL(blob);
                 if (imgRef.current) imgRef.current.src = url;
@@ -518,6 +586,7 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
             displayEl.removeEventListener('wheel', onWheel);
             displayEl.removeEventListener('contextmenu', onContextMenu);
             releaseObjectUrl();
+            cleanupVideo();
             ws.close();
         };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -625,6 +694,7 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
                 {/* eslint-disable-next-line jsx-a11y/alt-text */}
                 <div ref={zoomLayerRef} className="absolute inset-0">
                     <img ref={imgRef} className="w-full h-full" style={{ objectFit: 'fill' }} draggable={false} />
+                    <canvas ref={canvasRef} className="absolute inset-0 w-full h-full pointer-events-none" style={{ display: 'none' }} />
                     {/* eslint-disable-next-line jsx-a11y/alt-text */}
                     <img ref={cursorImgRef} className="absolute top-0 left-0 pointer-events-none select-none" style={{ display: 'none' }} draggable={false} />
                 </div>

@@ -23,6 +23,9 @@ export interface RustDeskClientOptions {
   myId?: string;
   myName?: string;
   connectTimeoutMs?: number;
+  // OptionMessage.ImageQuality: Low=2, Balanced=3, Best=4. Lower = peer compresses harder.
+  imageQuality?: number;
+  fps?: number;
 }
 
 export interface RustDeskPeerInfo {
@@ -48,6 +51,8 @@ export class RustDeskClient extends EventEmitter {
       myId: 'rdm',
       myName: 'RDM',
       connectTimeoutMs: 8000,
+      imageQuality: 4,
+      fps: 60,
       ...opts,
     };
   }
@@ -160,6 +165,10 @@ export class RustDeskClient extends EventEmitter {
     await this.#send({ keyEvent });
   }
 
+  async requestKeyframe(): Promise<void> {
+    await this.#send({ misc: { refreshVideo: true } });
+  }
+
   async sendClipboardText(text: string): Promise<void> {
     await this.#send({
       clipboard: {
@@ -219,8 +228,8 @@ export class RustDeskClient extends EventEmitter {
             // this custom_fps sets (uncapped otherwise it settles low degrees on a LAN
             // hop with even modest jitter). ImageQuality.Best asks for less aggressive
             // compression given we're not bandwidth-constrained on the Mac<->backend hop.
-            imageQuality: 4, // OptionMessage.ImageQuality.Best
-            customFps: 60,
+            imageQuality: this.#opts.imageQuality,
+            customFps: this.#opts.fps,
           },
         },
       });

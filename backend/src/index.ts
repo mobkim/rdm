@@ -618,7 +618,7 @@ app.post('/api/connect', async (req, res) => {
                     automationStatus.rustdesk = 'idle';
                 }
             }
-            const sessionId = createRustDeskSession({ host, password });
+            const sessionId = createRustDeskSession({ host, password, quality: settings.rustdeskQuality, decode: settings.rustdeskDecode });
             return res.json({ sessionId, instanceId: instanceId || customId, protocol: 'rustdesk' });
         }
 

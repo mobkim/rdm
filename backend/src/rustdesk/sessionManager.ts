@@ -15,7 +15,20 @@ interface PendingSession {
   port?: number;
   password: string;
   createdAt: number;
+  profile: RustDeskProfile;
+  passthrough: boolean;
 }
+
+// Speed/quality tradeoff, chosen in the frontend's Global Settings. The ffmpeg JPEG
+// re-encode and the browser hop are usually the bottleneck, so the presets lower the
+// peer's encode quality/fps, JPEG quality, and (for 'speed') downscale the output.
+export type RustDeskQuality = 'quality' | 'balanced' | 'speed';
+interface RustDeskProfile { imageQuality: number; fps: number; jpegQuality: number; maxWidth?: number }
+const PROFILES: Record<RustDeskQuality, RustDeskProfile> = {
+  quality: { imageQuality: 4, fps: 60, jpegQuality: 5 },
+  balanced: { imageQuality: 3, fps: 30, jpegQuality: 8, maxWidth: 1920 },
+  speed: { imageQuality: 2, fps: 30, jpegQuality: 13, maxWidth: 1280 },
+};
 
 // A rustdesk session is claimed within seconds of /api/connect returning it (the
 // frontend opens the WebSocket immediately) — this only guards against a stale
@@ -23,9 +36,11 @@ interface PendingSession {
 const PENDING_TTL_MS = 30_000;
 const pending = new Map<string, PendingSession>();
 
-export function createRustDeskSession(opts: { host: string; port?: number; password: string }): string {
+export function createRustDeskSession(opts: { host: string; port?: number; password: string; quality?: string; decode?: string }): string {
   const id = crypto.randomUUID();
-  pending.set(id, { ...opts, createdAt: Date.now() });
+  const { quality, decode, ...rest } = opts;
+  const profile = PROFILES[quality as RustDeskQuality] ?? PROFILES.quality;
+  pending.set(id, { ...rest, profile, passthrough: decode === 'browser', createdAt: Date.now() });
   return id;
 }
 
@@ -57,6 +72,8 @@ function longToNumber(v: unknown): number {
 // drop a frame outright and let the next one (which will be more current) through.
 const MAX_WS_BUFFERED_BYTES = 2 * 1024 * 1024;
 
+type EncodedFrames = { frames?: Array<{ data: Uint8Array; key?: boolean; pts?: unknown }> };
+
 export async function attachRustDeskSession(id: string, ws: WebSocket): Promise<void> {
   const session = takePendingSession(id);
   if (!session) {
@@ -69,8 +86,11 @@ export async function attachRustDeskSession(id: string, ws: WebSocket): Promise<
     ...(session.port !== undefined ? { port: session.port } : {}),
     password: session.password,
     myName: 'RDM',
+    imageQuality: session.profile.imageQuality,
+    fps: session.profile.fps,
   });
   let decoder: Vp9JpegDecoder | null = null;
+  let waitingForKey = false;
   // TEMP DEBUG: remove once the lag/quality report is resolved — distinguishes "the
   // Mac isn't sending frames fast enough" from problems further down the pipeline.
   let recvCount = 0;
@@ -96,7 +116,34 @@ export async function attachRustDeskSession(id: string, ws: WebSocket): Promise<
   client.on('video-frame', (vf: Record<string, unknown>) => {
     // MVP only decodes VP9 (see videoDecoder.ts) — the only codec field probe.ts
     // ever observed the Mac send, since its PeerInfo.encoding never advertised h264.
-    const vp9s = vf.vp9s as { frames?: Array<{ data: Uint8Array; pts?: unknown }> } | undefined;
+    if (session.passthrough) {
+      // Forward the compressed frames untouched; the browser decodes them with
+      // WebCodecs (hardware). Wire format: [codec: 1=vp9 2=h264][key: 0/1][bytes].
+      // Never drop an inter frame mid-GOP — that corrupts everything until the next
+      // keyframe — so on backpressure drop until a keyframe and ask the peer for one.
+      const vp9 = vf.vp9s as EncodedFrames | undefined;
+      const h264 = vf.h264s as EncodedFrames | undefined;
+      const frames = vp9?.frames ?? h264?.frames;
+      if (!frames) return;
+      const codec = vp9?.frames ? 1 : 2;
+      for (const f of frames) {
+        recvCount++;
+        if (ws.readyState !== ws.OPEN) return;
+        const key = Boolean(f.key);
+        if (ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
+          if (!waitingForKey) { waitingForKey = true; client.requestKeyframe().catch(() => {}); }
+        }
+        if (waitingForKey) {
+          if (!key) continue;
+          if (ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) continue;
+          waitingForKey = false;
+        }
+        const data = Buffer.from(f.data);
+        ws.send(Buffer.concat([Buffer.from([codec, key ? 1 : 0]), data]), { binary: true });
+      }
+      return;
+    }
+    const vp9s = vf.vp9s as EncodedFrames | undefined;
     if (!vp9s?.frames || !decoder) return;
     recvCount += vp9s.frames.length;
     for (const frame of vp9s.frames) {
@@ -168,7 +215,14 @@ export async function attachRustDeskSession(id: string, ws: WebSocket): Promise<
     const peerInfo = await client.connect();
     const display = peerInfo.displays?.[0];
     console.log(`[rustdesk debug] display ${display?.width}x${display?.height}`);
-    decoder = new Vp9JpegDecoder(display?.width ?? 1920, display?.height ?? 1080);
+    if (session.passthrough) {
+      sendJson(ws, { type: 'connected', peerInfo });
+      return;
+    }
+    decoder = new Vp9JpegDecoder(display?.width ?? 1920, display?.height ?? 1080, {
+      jpegQuality: session.profile.jpegQuality,
+      ...(session.profile.maxWidth ? { maxWidth: session.profile.maxWidth } : {}),
+    });
     // TEMP DEBUG: remove once the lag/quality report is resolved. Distinguishes
     // "peer isn't sending frames fast enough" from "we're dropping frames we did get".
     let sentCount = 0;
