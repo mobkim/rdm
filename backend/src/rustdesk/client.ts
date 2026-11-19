@@ -79,12 +79,20 @@ export class RustDeskClient extends EventEmitter {
 
       const socket = net.createConnection({ host: this.#opts.host, port: this.#opts.port });
       this.#socket = socket;
+      socket.setNoDelay(true);
+      socket.setKeepAlive(true, 10_000);
 
+      const startedAt = Date.now();
+      let lastRx = startedAt;
+      socket.on('data', () => { lastRx = Date.now(); });
+      socket.on('end', () => console.log(`[rustdesk] peer ${this.#opts.host} sent FIN after ${((Date.now() - startedAt) / 1000).toFixed(1)}s`));
       socket.on('error', (err) => {
+        console.log(`[rustdesk] socket error ${(err as NodeJS.ErrnoException).code} after ${((Date.now() - startedAt) / 1000).toFixed(1)}s (last data ${((Date.now() - lastRx) / 1000).toFixed(1)}s ago, loggedIn=${this.#loggedIn})`);
         settleReject(err);
         this.emit('error', err);
       });
       socket.on('close', () => {
+        this.#stopHeartbeat();
         this.#loggedIn = false;
         this.emit('close');
       });
@@ -98,7 +106,27 @@ export class RustDeskClient extends EventEmitter {
     });
   }
 
+  #heartbeat: NodeJS.Timeout | null = null;
+  #videoAcked = false;
+
+  // The official client sends its own TestDelay every second (client.rs); the peer uses it
+  // as a liveness signal and may drop a controller that stays silent, which surfaces
+  // here as ECONNRESET.
+  #startHeartbeat(): void {
+    this.#stopHeartbeat();
+    this.#heartbeat = setInterval(() => {
+      this.#send({ testDelay: { time: Date.now(), fromClient: true, lastDelay: 0, targetBitrate: 0 } }).catch(() => {});
+    }, 1000);
+    this.#heartbeat.unref();
+  }
+
+  #stopHeartbeat(): void {
+    if (this.#heartbeat) clearInterval(this.#heartbeat);
+    this.#heartbeat = null;
+  }
+
   disconnect(): void {
+    this.#stopHeartbeat();
     this.#socket?.end();
     this.#socket?.destroy();
     this.#socket = null;
@@ -210,6 +238,7 @@ export class RustDeskClient extends EventEmitter {
         this.#loggedIn = true;
         const peerInfo = lr.peerInfo as unknown as RustDeskPeerInfo;
         this.emit('login', peerInfo);
+        this.#startHeartbeat();
         resolve({ peerInfo });
         return;
       }
@@ -225,6 +254,10 @@ export class RustDeskClient extends EventEmitter {
     }
 
     if (m.videoFrame) {
+      if (!this.#videoAcked) {
+        this.#videoAcked = true;
+        this.#send({ misc: { videoReceived: true } }).catch(() => {});
+      }
       this.emit('video-frame', m.videoFrame);
       return;
     }
