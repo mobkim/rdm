@@ -2160,7 +2160,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
     };
 
     return (
-        <div className="h-screen bg-slate-950 text-slate-200 flex flex-col font-sans relative overflow-hidden">
+        <div className="h-dvh bg-slate-950 text-slate-200 flex flex-col font-sans relative overflow-hidden">
             {!isHeaderVisible && (
                 <button
                     onClick={() => setIsHeaderVisible(true)}
@@ -2284,7 +2284,7 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
 
                 {/* Sidebar */}
                 {isSidebarVisible && (
-                    <aside className="w-64 bg-slate-900 border-r border-slate-800 flex flex-col overflow-y-auto shrink-0">
+                    <aside className="w-64 max-md:absolute max-md:inset-y-0 max-md:left-0 max-md:z-30 max-md:shadow-2xl bg-slate-900 border-r border-slate-800 flex flex-col overflow-y-auto shrink-0">
                         <div className="p-4 border-b border-slate-800 flex justify-between items-center">
                             <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Active Instances</h2>
                             <div className="flex items-center gap-1">
@@ -2345,12 +2345,12 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                             <span className="text-xs opacity-60 truncate font-mono mt-0.5 ml-4">{inst.ip}</span>
                                         </div>
                                         <div className="relative shrink-0">
-                                            <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                            <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 touch:opacity-100 transition-opacity">
                                                 <button onClick={() => openEditCustom(inst)} title="Instance Settings" className="text-slate-400 hover:text-white p-1"><Settings size={14}/></button>
                                                 <button onClick={() => confirmDeleteCustom(inst)} title="Remove" className="text-red-400 hover:text-red-300 p-1"><X size={14}/></button>
                                             </div>
                                             {inst.os && (
-                                                <span className="absolute inset-0 flex items-center justify-end text-slate-500 group-hover:opacity-0 transition-opacity pointer-events-none">
+                                                <span className="absolute inset-0 flex items-center justify-end text-slate-500 group-hover:opacity-0 touch:hidden transition-opacity pointer-events-none">
                                                     <OsIcon os={inst.os} />
                                                 </span>
                                             )}
@@ -2448,9 +2448,9 @@ function App({ authStatus, onAuthRefresh }: AppProps) {
                                             <span className="text-xs opacity-60 truncate font-mono mt-0.5 ml-4">{inst.id}</span>
                                         </div>
                                         <div className="relative shrink-0">
-                                            <button onClick={() => openEditEc2(inst)} title="Instance Settings" className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-white p-1 transition-opacity"><Settings size={14}/></button>
+                                            <button onClick={() => openEditEc2(inst)} title="Instance Settings" className="opacity-0 group-hover:opacity-100 touch:opacity-100 text-slate-400 hover:text-white p-1 transition-opacity"><Settings size={14}/></button>
                                             {inst.os && (
-                                                <span className="absolute inset-0 flex items-center justify-center text-slate-500 group-hover:opacity-0 transition-opacity pointer-events-none">
+                                                <span className="absolute inset-0 flex items-center justify-center text-slate-500 group-hover:opacity-0 touch:hidden transition-opacity pointer-events-none">
                                                     <OsIcon os={inst.os} />
                                                 </span>
                                             )}

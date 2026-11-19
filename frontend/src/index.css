@@ -1,5 +1,10 @@
 @import "tailwindcss";
 
+/* Devices with no hover (phones/tablets): Tailwind's own hover: variants are
+   already gated to hover-capable devices, so hover-revealed controls need an
+   explicit counterpart to be reachable by touch. */
+@custom-variant touch (@media (hover: none));
+
 /* Toast entrance — a small slide/fade so notifications feel responsive. */
 @keyframes toastIn {
     from { opacity: 0; transform: translateY(10px) scale(0.98); }

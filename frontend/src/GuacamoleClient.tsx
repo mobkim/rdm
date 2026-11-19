@@ -1,8 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Maximize, Minimize, RefreshCw, X, GripVertical } from 'lucide-react';
+import { Maximize, Minimize, RefreshCw, X, GripVertical, Keyboard } from 'lucide-react';
 import Guacamole from 'guacamole-common-js';
 import { writeDeviceClipboard } from './deviceClipboard';
 import { OS_ICONS } from './OsIcons';
+import { attachSoftKeyboard, attachTouchGestures, createZoomController, SpecialKey, ZoomController } from './touchInput';
+import { useSessionFullscreen } from './useSessionFullscreen';
 
 interface Props {
     instanceId: string;
@@ -97,7 +99,14 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, layoutVersio
     // dying on the way up — worth reporting, unlike a normal close.
     const wasConnected = useRef(false);
     const failed = useRef(false);
-    const [isFullscreen, setIsFullscreen] = useState(false);
+    const fs = useSessionFullscreen(() => rootRef.current?.parentElement);
+    const isFullscreen = fs.isFullscreen;
+    // Read by measureBox (which the mount-only observer effect captures once).
+    const fsViewportRef = useRef(fs.pseudo ? fs.viewport : null);
+    fsViewportRef.current = fs.pseudo ? fs.viewport : null;
+    const zoomRef = useRef<ZoomController | null>(null);
+    const kbRef = useRef<HTMLTextAreaElement>(null);
+    const [kbOpen, setKbOpen] = useState(false);
     // Explicit display size: the largest 16:9 rectangle that fits the grid cell
     // *below* the static header. Computed in JS because pure-CSS aspect-ratio
     // can't reliably produce a "largest fitting box" for a plain <div> when
@@ -127,8 +136,11 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, layoutVersio
     // reserving room for the static header.
     const measureBox = () => {
         const cell = rootRef.current?.parentElement;
-        if (!cell) return;
-        const cw = cell.clientWidth;
+        // Touch "fullscreen" pins the pane to the (visual) viewport, so size
+        // against that instead of the grid cell it's been lifted out of.
+        const vp = fsViewportRef.current;
+        if (!cell && !vp) return;
+        const cw = vp ? vp.w : cell!.clientWidth;
         if (cw <= 0) return;
         let w = cw;
         let h = (w * 9) / 16;
@@ -138,9 +150,9 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, layoutVersio
         // and lets the page scroll — clamping to `ch` there is also how the
         // old min-h-screen/auto-rows-fr combo produced its runaway-growth
         // feedback loop: `ch` was itself derived from this same box.
-        if (fitViewportRef.current) {
+        if (vp || fitViewportRef.current) {
             const headerH = headerRef.current?.offsetHeight ?? 0;
-            const ch = cell.clientHeight - headerH;
+            const ch = (vp ? vp.h : cell!.clientHeight) - headerH;
             if (ch <= 0) return;
             if (h > ch) { h = ch; w = (h * 16) / 9; }
         }
@@ -173,6 +185,16 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, layoutVersio
         measureBox();
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [layoutVersion]);
+
+    // Entering/leaving touch fullscreen, rotating, or the on-screen keyboard
+    // opening changes the viewport rather than the cell, so remeasure for those.
+    useLayoutEffect(() => {
+        measureBox();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [fs.pseudo, fs.viewport?.w, fs.viewport?.h]);
+
+    // Keep a pinch-zoomed view inside bounds when the pane resizes.
+    useLayoutEffect(() => { zoomRef.current?.clamp(); }, [box?.w, box?.h]);
 
     // Rescale synchronously (before paint) whenever `box` changes size, so the
     // canvas is never shown at a stale scale for even one frame. This runs in
@@ -383,6 +405,53 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, layoutVersio
             client.sendMouseState(scaledState);
         };
 
+        // Touch: Guacamole.Mouse only understands mouse events, so drive the
+        // pointer ourselves from touch gestures (see touchInput.ts).
+        const touchButtons = { left: false, right: false };
+        let touchX = 0, touchY = 0;
+        const sendTouchPointer = () => client.sendMouseState(new Guacamole.Mouse.State(
+            touchX, touchY, touchButtons.left, false, touchButtons.right, false, false));
+        const setTouchPos = (cx: number, cy: number) => {
+            const rect = displayEl.getBoundingClientRect();
+            const scale = display.getScale() || 1;
+            touchX = (cx - rect.left) / scale;
+            touchY = (cy - rect.top) / scale;
+        };
+        // Pinch-zoom is a CSS transform on the display element, which the
+        // getBoundingClientRect() in setTouchPos already accounts for.
+        const zoom = createZoomController(displayRef.current, () => displayEl);
+        zoomRef.current = zoom;
+        const detachTouch = attachTouchGestures(displayRef.current, {
+            zoom,
+            move: (cx, cy) => { setTouchPos(cx, cy); sendTouchPointer(); },
+            button: (which, down, cx, cy) => {
+                setTouchPos(cx, cy);
+                touchButtons[which] = down;
+                sendTouchPointer();
+            },
+            scroll: (notches) => {
+                const up = notches < 0;
+                for (let i = 0; i < Math.abs(notches); i++) {
+                    client.sendMouseState(new Guacamole.Mouse.State(touchX, touchY, touchButtons.left, false, touchButtons.right, up, !up));
+                    sendTouchPointer();
+                }
+            },
+        });
+
+        // On-screen keyboard: forwards the hidden textarea's output as keysyms.
+        const SPECIAL_KEYSYMS: Record<SpecialKey, number> = {
+            Backspace: 0xFF08, Tab: 0xFF09, Enter: 0xFF0D, Escape: 0xFF1B,
+            ArrowLeft: 0xFF51, ArrowUp: 0xFF52, ArrowRight: 0xFF53, ArrowDown: 0xFF54,
+        };
+        const tap = (keysym: number) => { client.sendKeyEvent(1, keysym); client.sendKeyEvent(0, keysym); };
+        const detachSoftKeyboard = kbRef.current ? attachSoftKeyboard(kbRef.current, {
+            char: (cp) => {
+                if (cp === 10) tap(SPECIAL_KEYSYMS.Enter);
+                else if (cp >= 0x20) tap(cp < 0x100 ? cp : 0x01000000 + cp);
+            },
+            special: (key) => tap(SPECIAL_KEYSYMS[key]),
+        }) : () => {};
+
         // Remote copy -> shared clipboard. Publishing to the shared clipboard is
         // what makes copy/paste work *between* sessions: every other open session
         // then receives this text (see the broadcast effect below). We also make a
@@ -419,14 +488,12 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, layoutVersio
         const resizeObserver = new ResizeObserver(() => scaleDisplay());
         resizeObserver.observe(displayRef.current);
 
-        const handleFullscreenChange = () => {
-            setIsFullscreen(!!document.fullscreenElement);
-        };
-        document.addEventListener('fullscreenchange', handleFullscreenChange);
-
         return () => {
             cleanedUp = true;
-            document.removeEventListener('fullscreenchange', handleFullscreenChange);
+            detachTouch();
+            zoom.reset();
+            zoomRef.current = null;
+            detachSoftKeyboard();
             focusTarget.removeEventListener('blur', handleFocusLoss);
             window.removeEventListener('blur', handleFocusLoss);
             if (resizeObserver) resizeObserver.disconnect();
@@ -468,18 +535,14 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, layoutVersio
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [clipboard, status]);
 
-    const toggleFullscreen = () => {
-        // Fullscreen the grid cell (the pane's parent) rather than the pane
-        // itself, so the 16:9 sizing logic re-measures against the full screen.
-        const container = rootRef.current?.parentElement;
-        if (!container) return;
-        if (!document.fullscreenElement) {
-            container.requestFullscreen().catch(err => {
-                console.error('Error attempting to enable fullscreen:', err);
-            });
-        } else {
-            document.exitFullscreen();
-        }
+    const toggleFullscreen = fs.toggle;
+
+    // preventDefault on mousedown keeps the textarea from losing focus (and the
+    // keyboard from flickering) when the toggle button itself is tapped.
+    const toggleKeyboard = () => {
+        const ta = kbRef.current;
+        if (!ta) return;
+        if (document.activeElement === ta) ta.blur(); else ta.focus({ preventScroll: true });
     };
 
     // Single-click toggles in-page maximize; double-click still means real
@@ -509,8 +572,10 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, layoutVersio
     return (
         <div
             ref={rootRef}
-            className="relative bg-slate-900 border-2 border-slate-700 rounded-lg overflow-hidden flex flex-col group focus-within:border-yellow-400 focus-within:shadow-[0_0_15px_rgba(250,204,21,0.6)] transition-[border-color,box-shadow] duration-150 max-w-full max-h-full [contain:content]"
-            style={box ? { width: box.w } : { width: '100%', height: '100%' }}
+            className={`${fs.pseudo ? 'fixed z-[9999] bg-black border-0 rounded-none' : 'relative bg-slate-900 border-2 border-slate-700 rounded-lg'} overflow-hidden flex flex-col group focus-within:border-yellow-400 focus-within:shadow-[0_0_15px_rgba(250,204,21,0.6)] transition-[border-color,box-shadow] duration-150 max-w-full max-h-full [contain:content]`}
+            style={fs.pseudo && fs.viewport
+                ? { left: fs.viewport.left, top: fs.viewport.top, width: fs.viewport.w, height: fs.viewport.h }
+                : box ? { width: box.w } : { width: '100%', height: '100%' }}
             onClick={() => displayRef.current?.focus({ preventScroll: true })}
             onMouseEnter={focusOnHover ? () => displayRef.current?.focus({ preventScroll: true }) : undefined}
         >
@@ -535,16 +600,24 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, layoutVersio
                     })()}
                     <span className="font-semibold text-sm truncate">{name} {ip && <span className="opacity-60 font-mono text-xs ml-1">{ip}</span>}</span>
                 </span>
-                <div className="flex gap-4 items-center shrink-0 ml-4 opacity-0 group-hover/bar:opacity-100 transition-opacity">
+                <div className="flex gap-4 items-center shrink-0 ml-4 opacity-0 group-hover/bar:opacity-100 touch:opacity-100 transition-opacity">
+                    <button
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={(e) => { e.stopPropagation(); toggleKeyboard(); }}
+                        className={`touch:inline-flex hidden p-1 -m-1 transition-colors ${kbOpen ? 'text-yellow-300' : 'text-slate-300 hover:text-white'}`}
+                        title="Keyboard"
+                    >
+                        <Keyboard size={18} />
+                    </button>
                     {onRefresh && (
-                        <button onClick={(e) => { e.stopPropagation(); onRefresh(); }} className="text-slate-300 hover:text-white transition-colors" title="Refresh session">
+                        <button onClick={(e) => { e.stopPropagation(); onRefresh(); }} className="text-slate-300 hover:text-white transition-colors p-1 -m-1" title="Refresh session">
                             <RefreshCw size={16} />
                         </button>
                     )}
-                    <button onClick={(e) => { e.stopPropagation(); toggleFullscreen(); }} className="text-slate-300 hover:text-white transition-colors" title="Fullscreen">
+                    <button onClick={(e) => { e.stopPropagation(); toggleFullscreen(); }} className="text-slate-300 hover:text-white transition-colors p-1 -m-1" title="Fullscreen">
                         {isFullscreen ? <Minimize size={16} /> : <Maximize size={16} />}
                     </button>
-                    <button onClick={(e) => { e.stopPropagation(); onDisconnect(); }} className="text-red-400 hover:text-red-300 transition-colors" title="Disconnect">
+                    <button onClick={(e) => { e.stopPropagation(); onDisconnect(); }} className="text-red-400 hover:text-red-300 transition-colors p-1 -m-1" title="Disconnect">
                         <X size={20} />
                     </button>
                 </div>
@@ -554,9 +627,25 @@ export const GuacamoleClient: React.FC<Props> = ({ token, name, ip, layoutVersio
                 fills it with no letterboxing */}
             <div
                 ref={displayRef}
-                className="relative flex items-center justify-center outline-none cursor-none overflow-hidden bg-black shrink-0"
+                className="relative flex items-center justify-center outline-none cursor-none overflow-hidden bg-black shrink-0 mx-auto my-auto touch-none select-none"
                 style={box ? { width: box.w, height: box.h } : { flex: 1, width: '100%' }}
                 tabIndex={0}
+            />
+
+            {/* Hidden input that summons the OS keyboard on touch devices; its
+                output is forwarded to the remote (see attachSoftKeyboard).
+                16px font so iOS doesn't zoom the page on focus. */}
+            <textarea
+                ref={kbRef}
+                aria-label="Remote keyboard input"
+                className="absolute bottom-0 left-0 w-px h-px opacity-0 pointer-events-none resize-none border-0 p-0"
+                style={{ fontSize: 16 }}
+                autoCapitalize="off"
+                autoCorrect="off"
+                autoComplete="off"
+                spellCheck={false}
+                onFocus={() => setKbOpen(true)}
+                onBlur={() => setKbOpen(false)}
             />
         </div>
     );

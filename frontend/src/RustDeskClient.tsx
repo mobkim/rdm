@@ -1,7 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Maximize, Minimize, RefreshCw, X, GripVertical } from 'lucide-react';
+import { Maximize, Minimize, RefreshCw, X, GripVertical, Keyboard } from 'lucide-react';
 import { writeDeviceClipboard } from './deviceClipboard';
 import { OS_ICONS } from './OsIcons';
+import { attachSoftKeyboard, attachTouchGestures, createZoomController, SpecialKey, ZoomController } from './touchInput';
+import { useSessionFullscreen } from './useSessionFullscreen';
 
 interface Props {
     instanceId: string;
@@ -116,19 +118,29 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
     fitViewportRef.current = fitViewport;
     const wasConnected = useRef(false);
     const failed = useRef(false);
-    const [isFullscreen, setIsFullscreen] = useState(false);
+    const fs = useSessionFullscreen(() => rootRef.current?.parentElement);
+    const isFullscreen = fs.isFullscreen;
+    const fsViewportRef = useRef(fs.pseudo ? fs.viewport : null);
+    fsViewportRef.current = fs.pseudo ? fs.viewport : null;
+    const zoomRef = useRef<ZoomController | null>(null);
+    const zoomLayerRef = useRef<HTMLDivElement>(null);
+    const kbRef = useRef<HTMLTextAreaElement>(null);
+    const [kbOpen, setKbOpen] = useState(false);
     const [box, setBox] = useState<{ w: number; h: number } | null>(null);
 
     const measureBox = () => {
         const cell = rootRef.current?.parentElement;
-        if (!cell) return;
-        const cw = cell.clientWidth;
+        // Touch "fullscreen" pins the pane to the (visual) viewport — see
+        // GuacamoleClient's measureBox.
+        const vp = fsViewportRef.current;
+        if (!cell && !vp) return;
+        const cw = vp ? vp.w : cell!.clientWidth;
         if (cw <= 0) return;
         let w = cw;
         let h = (w * 9) / 16;
-        if (fitViewportRef.current) {
+        if (vp || fitViewportRef.current) {
             const headerH = headerRef.current?.offsetHeight ?? 0;
-            const ch = cell.clientHeight - headerH;
+            const ch = (vp ? vp.h : cell!.clientHeight) - headerH;
             if (ch <= 0) return;
             if (h > ch) { h = ch; w = (h * 16) / 9; }
         }
@@ -153,6 +165,15 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
         measureBox();
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [layoutVersion]);
+
+    // Keep a pinch-zoomed view inside bounds when the pane resizes.
+    useLayoutEffect(() => { zoomRef.current?.clamp(); }, [box?.w, box?.h]);
+
+    // Viewport changes (touch fullscreen, rotation, on-screen keyboard).
+    useLayoutEffect(() => {
+        measureBox();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [fs.pseudo, fs.viewport?.w, fs.viewport?.h]);
 
     useEffect(() => {
         if (!displayRef.current) return;
@@ -187,10 +208,12 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
                 cursorEl.style.display = 'none';
                 return;
             }
-            const rect = el.getBoundingClientRect();
-            if (!rect.width || !rect.height) return;
-            const scaleX = rect.width / displaySize.current.w;
-            const scaleY = rect.height / displaySize.current.h;
+            // Layout size, not getBoundingClientRect: the cursor lives inside
+            // the zoom layer, so the zoom transform scales it for us.
+            const width = el.offsetWidth, height = el.offsetHeight;
+            if (!width || !height) return;
+            const scaleX = width / displaySize.current.w;
+            const scaleY = height / displaySize.current.h;
             const { x, y } = cursorPos.current;
             cursorEl.style.display = 'block';
             cursorEl.style.width = `${cursor.width * scaleX}px`;
@@ -289,7 +312,7 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
         // not el.naturalWidth). Returns null rather than a guessed {x:0, y:0} when the
         // element isn't laid out yet — callers must skip sending on null, since {0,0}
         // would be a real absolute move command to the screen's top-left corner.
-        const scaleCoords = (e: React.MouseEvent | MouseEvent): { x: number; y: number } | null => {
+        const scaleCoords = (e: { clientX: number; clientY: number }): { x: number; y: number } | null => {
             const el = imgRef.current;
             if (!el) return null;
             const rect = el.getBoundingClientRect();
@@ -347,6 +370,42 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
         displayEl.addEventListener('mouseup', onMouseUp);
         displayEl.addEventListener('wheel', onWheel, { passive: false });
         displayEl.addEventListener('contextmenu', onContextMenu);
+
+        // Touch: drive the pointer from gestures (see touchInput.ts). Mouse
+        // events are never emitted by touches because the gesture layer
+        // preventDefaults them.
+        const touchMods = () => modifiersArray();
+        const touchMove = (cx: number, cy: number) => {
+            const coords = scaleCoords({ clientX: cx, clientY: cy });
+            if (!coords) return null;
+            cursorPos.current = coords;
+            positionCursor();
+            return coords;
+        };
+        // Pinch-zoom is a CSS transform on the zoom layer wrapping the frame
+        // and cursor; scaleCoords measures the (transformed) <img>, so mouse
+        // mapping stays correct.
+        const zoom = createZoomController(displayEl, () => zoomLayerRef.current);
+        zoomRef.current = zoom;
+        const detachTouch = attachTouchGestures(displayEl, {
+            zoom,
+            move: (cx, cy) => {
+                const c = touchMove(cx, cy);
+                if (c) send({ type: 'mouse', mask: MOUSE_TYPE_MOVE, x: c.x, y: c.y, modifiers: touchMods() });
+            },
+            button: (which, down, cx, cy) => {
+                const c = touchMove(cx, cy);
+                if (!c) return;
+                const bit = which === 'right' ? MOUSE_BUTTON_RIGHT : MOUSE_BUTTON_LEFT;
+                send({ type: 'mouse', mask: (down ? MOUSE_TYPE_DOWN : MOUSE_TYPE_UP) | (bit << 3), x: c.x, y: c.y, modifiers: touchMods() });
+            },
+            scroll: (notches) => {
+                // Same sign convention as onWheel above: down = negative.
+                for (let i = 0; i < Math.abs(notches); i++) {
+                    send({ type: 'mouse', mask: MOUSE_TYPE_WHEEL, x: 0, y: notches > 0 ? -wheelStep : wheelStep, modifiers: touchMods() });
+                }
+            },
+        });
 
         // Keyboard: focus-gated like GuacamoleClient — only forward while this
         // pane's display element has focus.
@@ -419,12 +478,36 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
         focusTarget.addEventListener('blur', releaseAllKeys);
         window.addEventListener('blur', releaseAllKeys);
 
-        const handleFullscreenChange = () => setIsFullscreen(!!document.fullscreenElement);
-        document.addEventListener('fullscreenchange', handleFullscreenChange);
+        // On-screen keyboard: forwards the hidden textarea's output. The document-level
+        // key handlers above ignore it since it isn't `focusTarget`.
+        const SPECIAL_CONTROL_KEYS: Record<SpecialKey, number> = {
+            Backspace: ControlKey.Backspace, Tab: ControlKey.Tab, Enter: ControlKey.Return,
+            Escape: ControlKey.Escape, ArrowLeft: ControlKey.LeftArrow, ArrowUp: ControlKey.UpArrow,
+            ArrowRight: ControlKey.RightArrow, ArrowDown: ControlKey.DownArrow,
+        };
+        const detachSoftKeyboard = kbRef.current ? attachSoftKeyboard(kbRef.current, {
+            char: (cp) => {
+                if (cp === 10) {
+                    send({ type: 'key', down: true, press: false, controlKey: ControlKey.Return, modifiers: [] });
+                    send({ type: 'key', down: false, press: false, controlKey: ControlKey.Return, modifiers: [] });
+                } else if (cp >= 0x20) {
+                    send({ type: 'key', down: true, press: false, chr: cp, modifiers: [] });
+                    send({ type: 'key', down: false, press: false, chr: cp, modifiers: [] });
+                }
+            },
+            special: (key) => {
+                const controlKey = SPECIAL_CONTROL_KEYS[key];
+                send({ type: 'key', down: true, press: false, controlKey, modifiers: [] });
+                send({ type: 'key', down: false, press: false, controlKey, modifiers: [] });
+            },
+        }) : () => {};
 
         return () => {
             cleanedUp = true;
-            document.removeEventListener('fullscreenchange', handleFullscreenChange);
+            detachTouch();
+            zoom.reset();
+            zoomRef.current = null;
+            detachSoftKeyboard();
             document.removeEventListener('keydown', onKeyDown);
             document.removeEventListener('keyup', onKeyUp);
             focusTarget.removeEventListener('blur', releaseAllKeys);
@@ -450,14 +533,13 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [clipboard, status]);
 
-    const toggleFullscreen = () => {
-        const container = rootRef.current?.parentElement;
-        if (!container) return;
-        if (!document.fullscreenElement) {
-            container.requestFullscreen().catch((err) => console.error('Error attempting to enable fullscreen:', err));
-        } else {
-            document.exitFullscreen();
-        }
+    const toggleFullscreen = fs.toggle;
+
+    // Tapping the toggle button must not steal focus from the hidden textarea.
+    const toggleKeyboard = () => {
+        const ta = kbRef.current;
+        if (!ta) return;
+        if (document.activeElement === ta) ta.blur(); else ta.focus({ preventScroll: true });
     };
 
     // See GuacamoleClient's copy: single-click toggles in-page maximize,
@@ -486,8 +568,10 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
     return (
         <div
             ref={rootRef}
-            className="relative bg-slate-900 border-2 border-slate-700 rounded-lg overflow-hidden flex flex-col group focus-within:border-yellow-400 focus-within:shadow-[0_0_15px_rgba(250,204,21,0.6)] transition-[border-color,box-shadow] duration-150 max-w-full max-h-full [contain:content]"
-            style={box ? { width: box.w } : { width: '100%', height: '100%' }}
+            className={`${fs.pseudo ? 'fixed z-[9999] bg-black border-0 rounded-none' : 'relative bg-slate-900 border-2 border-slate-700 rounded-lg'} overflow-hidden flex flex-col group focus-within:border-yellow-400 focus-within:shadow-[0_0_15px_rgba(250,204,21,0.6)] transition-[border-color,box-shadow] duration-150 max-w-full max-h-full [contain:content]`}
+            style={fs.pseudo && fs.viewport
+                ? { left: fs.viewport.left, top: fs.viewport.top, width: fs.viewport.w, height: fs.viewport.h }
+                : box ? { width: box.w } : { width: '100%', height: '100%' }}
             onClick={() => displayRef.current?.focus({ preventScroll: true })}
             onMouseEnter={focusOnHover ? () => displayRef.current?.focus({ preventScroll: true }) : undefined}
         >
@@ -509,16 +593,24 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
                     })()}
                     <span className="font-semibold text-sm truncate">{name} {ip && <span className="opacity-60 font-mono text-xs ml-1">{ip}</span>}</span>
                 </span>
-                <div className="flex gap-4 items-center shrink-0 ml-4 opacity-0 group-hover/bar:opacity-100 transition-opacity">
+                <div className="flex gap-4 items-center shrink-0 ml-4 opacity-0 group-hover/bar:opacity-100 touch:opacity-100 transition-opacity">
+                    <button
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={(e) => { e.stopPropagation(); toggleKeyboard(); }}
+                        className={`touch:inline-flex hidden p-1 -m-1 transition-colors ${kbOpen ? 'text-yellow-300' : 'text-slate-300 hover:text-white'}`}
+                        title="Keyboard"
+                    >
+                        <Keyboard size={18} />
+                    </button>
                     {onRefresh && (
-                        <button onClick={(e) => { e.stopPropagation(); onRefresh(); }} className="text-slate-300 hover:text-white transition-colors" title="Refresh session">
+                        <button onClick={(e) => { e.stopPropagation(); onRefresh(); }} className="text-slate-300 hover:text-white transition-colors p-1 -m-1" title="Refresh session">
                             <RefreshCw size={16} />
                         </button>
                     )}
-                    <button onClick={(e) => { e.stopPropagation(); toggleFullscreen(); }} className="text-slate-300 hover:text-white transition-colors" title="Fullscreen">
+                    <button onClick={(e) => { e.stopPropagation(); toggleFullscreen(); }} className="text-slate-300 hover:text-white transition-colors p-1 -m-1" title="Fullscreen">
                         {isFullscreen ? <Minimize size={16} /> : <Maximize size={16} />}
                     </button>
-                    <button onClick={(e) => { e.stopPropagation(); onDisconnect(); }} className="text-red-400 hover:text-red-300 transition-colors" title="Disconnect">
+                    <button onClick={(e) => { e.stopPropagation(); onDisconnect(); }} className="text-red-400 hover:text-red-300 transition-colors p-1 -m-1" title="Disconnect">
                         <X size={20} />
                     </button>
                 </div>
@@ -526,18 +618,35 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
 
             <div
                 ref={displayRef}
-                className="relative flex items-center justify-center outline-none cursor-none overflow-hidden bg-black shrink-0"
+                className="relative flex items-center justify-center outline-none cursor-none overflow-hidden bg-black shrink-0 mx-auto my-auto touch-none select-none"
                 style={box ? { width: box.w, height: box.h } : { flex: 1, width: '100%' }}
                 tabIndex={0}
             >
                 {/* eslint-disable-next-line jsx-a11y/alt-text */}
-                <img ref={imgRef} className="w-full h-full" style={{ objectFit: 'fill' }} draggable={false} />
-                {/* eslint-disable-next-line jsx-a11y/alt-text */}
-                <img ref={cursorImgRef} className="absolute top-0 left-0 pointer-events-none select-none" style={{ display: 'none' }} draggable={false} />
+                <div ref={zoomLayerRef} className="absolute inset-0">
+                    <img ref={imgRef} className="w-full h-full" style={{ objectFit: 'fill' }} draggable={false} />
+                    {/* eslint-disable-next-line jsx-a11y/alt-text */}
+                    <img ref={cursorImgRef} className="absolute top-0 left-0 pointer-events-none select-none" style={{ display: 'none' }} draggable={false} />
+                </div>
                 {status !== 'Connected' && (
                     <span className="absolute inset-0 flex items-center justify-center text-slate-400 text-sm pointer-events-none">{status}</span>
                 )}
             </div>
+
+            {/* Hidden input that summons the OS keyboard on touch devices — see
+                GuacamoleClient's copy. */}
+            <textarea
+                ref={kbRef}
+                aria-label="Remote keyboard input"
+                className="absolute bottom-0 left-0 w-px h-px opacity-0 pointer-events-none resize-none border-0 p-0"
+                style={{ fontSize: 16 }}
+                autoCapitalize="off"
+                autoCorrect="off"
+                autoComplete="off"
+                spellCheck={false}
+                onFocus={() => setKbOpen(true)}
+                onBlur={() => setKbOpen(false)}
+            />
         </div>
     );
 };
