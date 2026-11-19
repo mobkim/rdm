@@ -39,6 +39,9 @@ process.on('unhandledRejection', (reason) => {
 });
 process.on('uncaughtException', (err) => {
     console.error('Uncaught exception (kept process alive):', err);
+    // A failed bind leaves a process that runs timers but serves nothing (nginx 502).
+    // Die so the supervisor (launchd KeepAlive) retries once the port is free.
+    if ((err as NodeJS.ErrnoException)?.code === 'EADDRINUSE') process.exit(1);
 });
 
 const app = express();
@@ -468,9 +471,17 @@ server.on('upgrade', (req, socket, head) => {
 const shutdownRustdesk = () => {
     rustdeskWss.clients.forEach((ws) => ws.terminate());
     rustdeskWss.close();
+    // The HTTP server and idle-check intervals keep the event loop alive, and
+    // with signal handlers installed Node no longer exits by default — so
+    // without this a restart left the old process holding the port forever
+    // (new instance: EADDRINUSE). Give sockets a moment to close, then exit.
+    setTimeout(() => process.exit(0), 1500).unref();
 };
 process.on('SIGTERM', shutdownRustdesk);
 process.on('SIGINT', shutdownRustdesk);
+// Closing the terminal / killing the parent npx sends SIGHUP; without a handler
+// ts-node children were left orphaned, still running the idle-check interval.
+process.on('SIGHUP', shutdownRustdesk);
 
 app.get('/api/custom-instances', async (req, res) => {
     try {
@@ -1179,6 +1190,15 @@ setInterval(async () => {
 
 const PORT = process.env.PORT || 3001;
 
+// A second instance that can't bind the port must die, not linger: its timers
+// (notably the 12h idle auto-stop, whose "last use" never advances because no
+// requests reach it) would otherwise keep running and stop RustDesk/guacd
+// out from under the instance that is actually serving.
+server.on('error', (err) => {
+    console.error(`Server failed to listen on port ${PORT}:`, err);
+    process.exit(1);
+});
+
 initDb().then(() => {
     server.listen(PORT, () => {
         const scheme = (TLS_CERT && TLS_KEY) ? 'https' : 'http';
@@ -1186,4 +1206,5 @@ initDb().then(() => {
     });
 }).catch(err => {
     console.error("Failed to initialize database:", err);
+    process.exit(1);
 });
