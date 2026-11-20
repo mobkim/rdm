@@ -336,6 +336,10 @@ export const RustDeskClient: React.FC<Props> = ({ token, name, ip, layoutVersion
                             width: Number(msg.width),
                             height: Number(msg.height),
                         });
+                        // CursorData is also the peer's "cursor is now this shape" signal;
+                        // it only follows up with a bare cursor-id for shapes already sent.
+                        // Without this the first shape stayed cached but never displayed.
+                        currentCursorId.current = Number(msg.id);
                         positionCursor();
                     }
                 } else if (msg.type === 'cursor-id') {

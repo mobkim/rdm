@@ -283,14 +283,11 @@ export class RustDeskClient extends EventEmitter {
     }
 
     if (m.cursorData && typeof m.cursorData === 'object') {
-      // TEMP DEBUG: remove once cursor rendering is confirmed working end-to-end.
-      console.log('[rustdesk debug] cursorData', JSON.stringify(m.cursorData).slice(0, 200));
       this.emit('cursor-data', m.cursorData);
       return;
     }
 
     if (m.cursorPosition && typeof m.cursorPosition === 'object') {
-      console.log('[rustdesk debug] cursorPosition', JSON.stringify(m.cursorPosition));
       this.emit('cursor-position', m.cursorPosition);
       return;
     }
@@ -300,7 +297,6 @@ export class RustDeskClient extends EventEmitter {
     // discriminator property (named after the oneof block, "union") is the only reliable
     // way to tell whether this frame actually is a cursor_id switch.
     if ((msg as unknown as { union?: string }).union === 'cursorId') {
-      console.log('[rustdesk debug] cursorId', String(m.cursorId));
       this.emit('cursor-id', m.cursorId);
       return;
     }
